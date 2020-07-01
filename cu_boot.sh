@@ -1,2095 +1,2287 @@
-#!/bin/bash
+#!/bin/busybox sh
+# TODO
+# remove ramdisk part from mount_dev
+# unused if at the end of set_variables ?
+# add cryptsetup check in key generation
+# failed kernel config should clean up!
+#btus
+# ADD BTUSB
+# Add Hidraw
+# , kernel driver, bluez deprecated and pulseaudio flag
+# ###
+#
+# Configurable settings can be found in "set_variables" function.
+#fbtus
+# Messages:
+# blue - verbose
+# light_blue - regular
+# red - error
+# white - requires user action
+# yellow - warning, also requiring user attention
+#
+# Functions:
+# eg. - example
+# (value1|value2) - value must be either value1 or value2
+#
+# build_kernel
+#   action:
+#       builds a bzImage
+#   arguments:
+#       architecture (arm|x86_64)
+#   usage:
+#       build_kernel "arm"
+#
+# cecho
+#   action:
+#       echoes out a given string in color
+#   arguments:
+#       string
+#       color (blue|-blue|default|-default|green|-green|light_blue|-light_blue|red|-red|yellow|-yellow)
+#           -: no new line
+#   usage:
+#       cecho "Command has failed!" "red"
+#
+# check_for_program
+#   action:
+#       checks for a program, exits if not found
+#   arguments:
+#       program with options, must return 0
+#   usage:
+#       check_for_program "dd --help"
+#
+# check_if_argument_empty
+#   action:
+#       checks given variables, exits if is empty
+#   arguments:
+#       a list of variables to be chcecked
+#   usage:
+#       check_if_argument_empty "$color" "$message"
+#
+# get_dev_geometry
+#   action:
+#       obtains block device geometry
+#   arguments:
+#       a list of block devices
+#   exports:
+#       detected geometry for each device given:
+#           block_count_$(basename $argument)
+#           block_size_$(basename $device) (512|2048|4096)
+#   usage:
+#       get_dev_geometry "/dev/sda" "/dev/$device"
+#
+# run_command - executes a command if a given condition is true
+#   arguments:
+#       command
+#       condition to check before command execution (eg. [ -n "${variable:-}" ])
+#       error_message shown when $? ~= 0
+#       message shown when $? = 0
+#       permissible, do not fail when codition not true (do_not_fail_on_condition|fail_on_condition)
+#       resource to clean on script exit (device/mountpoint/process)
+#
+# ###
 
-# add bash script usage
-# add colors for verbose
-
-function build_kernel {
-    verbose "function build_kernel[$(echo $@)]"
+function back_up_root {
+    local backup_dir="$(echo $backup_lv | sed s:/:-:)"
+    local root_dir="$(echo $root_lv | sed s:/:-:)"
+    check_lvm "no" "$backup_lv"
+    mount_dev "/dev/mapper/$backup_dir"
     
-    kernel_type="$1"
+    cecho "default" "Please enter the backup file name, extension(.tar.bz2) and date(MMDDYY format) will be added automatically."
+    local name
+    read name
+    rm /mnt/"$root_dir"/back_up
+    cecho "blue" "Compressing..."
+    if [ -x /bin/tar -a -x /usr/bin/pigz ]; then
+        cecho "red" "using parallel"
+        time /bin/tar c -f /mnt/"$backup_dir"/${name}.tar.gz -C /mnt/"$root_dir" -I pigz --exclude ./dev --exclude ./lost+found --exclude ./media --exclude ./proc --exclude ./run --exclude ./sys --exclude ./tmp --exclude ./var/tmp .
+    else
+        time tar c -f /mnt/"$backup_dir"/${name}.tar.bz2 -C /mnt/"$root_dir" -j --exclude ./dev --exclude ./lost+found --exclude ./media --exclude ./proc --exclude ./run --exclude ./sys --exclude ./tmp --exclude ./var/tmp .
+    fi
 
-    laptop_kernel_config="x86_64_defconfig"
-    initramfs_source="CONFIG_INITRAMFS_SOURCE=\"/usr/src/$(readlink /usr/src/linux)-$kernel_type/initramfs\"
-CONFIG_INITRAMFS_ROOT_UID=0
-CONFIG_INITRAMFS_ROOT_GID=0"
-laptop_config="$initramfs_source"
-#    if [ "$2" == "update" ]; then echo "Updating the kernel..."; verbose "Deleting /usr/src/linux-$1 and /usr/src/linux-*-$1"; rm /usr/src/linux-$1; rm -r /usr/src/linux-*-$1; fi
-
-    if [ ! -L /usr/src/linux-"$kernel_type" ]; then
-        if [ -d /usr/src/linux ]; then kernel_dir=$(readlink /usr/src/linux); verbose "$kernel_dir has been found"; else echo "/usr/src/linux is missing. Please install kernel sources"; clean_up; fi
-            verbose "Creating $kernel_dir-$kernel_type directory"
-            mkdir /usr/src/$kernel_dir-"$kernel_type"
-            verbose "Updating kernel-NAS symlink"
-            ln -s /usr/src/$kernel_dir-"$kernel_type" /usr/src/linux-"$kernel_type"
-            verbose "Copying $kernel_dir to $kernel_dir-$kernel_type"
-            set +f
-            cp -r /usr/src/$kernel_dir/* /usr/src/$kernel_dir-$kernel_type
-            set -f
-        fi
-
-    kernel_dir=$(readlink /usr/src/linux)
-    create_initramfs "laptop"
-    echo "Building the kernel..."
-    verbose "Configuring $kernel_dir-$kernel_type"
-    make -C /usr/src/$kernel_dir-$kernel_type x86_64_defconfig
-    echo -e "$laptop_config" >> /usr/src/$kernel_dir-$kernel_type/.config
-    make -C /usr/src/$kernel_dir-$kernel_type -j 5 bzImage 
-    make -C /usr/src/$kernel_dir-$kernel_type install
-    sleep 1
 }
 
-function cecho {
-    local color=${2:-default}
-    local message="${1:-}"
-            
-    local blue="\e[034m"
-    local default="\e[0m"
-    local green="\e[032m"
-    local light_blue="\e[094m"
-    local red="\e[031m"
-    local yellow="\e[033m"
+function build_kernel {
+    check_number_of_arguments "build_kernel" "$#" "1"
+    local arch="${1:-}"
+    verbose "blue" "function build_kernel [architecture: $arch]"
+    check_if_argument_empty "$arch"
+    if [ "$arch" == "x86_64" -o "$arch" == "mvebu_v5" ]; then
+        local config="${arch}_defconfig"
+    else
+        cecho "red" "Not supported architecture set in arch variable[$arch] passed to build_kernel function. Please set to x86_64|mvebu_v5 and try again, exiting!"
+        exit_error
+    fi
     
-    if [ -n "$message" ]; then
-        if [ "$color" == "-b" ]; then
-            eval "echo -e -n \${blue}${message}\$default"
-        elif [ "$color" == "-d" ]; then
-            eval "echo -e -n \$message"
-        elif [ "$color" == "-g" ]; then
-            eval "echo -e -n \${green}${message}\$default"
-        elif [ "$color" == "-lb" ]; then
-            eval "echo -e -n \${light_blue}${message}\$default"
-        elif [ "$color" == "-r" ]; then
-            eval "echo -e -n \${red}${message}\$default"
-        elif [ "$color" == "-y" ]; then
-            eval "echo -e -n \${yellow}${message}\$default"
-        elif [ "$color" == "blue" -o "$color" == "green" -o "$color" == "light_blue" -o "$color" == "red" -o "$color" == "yellow" ]; then
-            eval "echo -e \${$color}${message}\$default"
-        elif [ "$color" == "default" ]; then
-            eval "echo -e $message"
+    local cores_num="$(cat /proc/cpuinfo | grep processor | wc -l)"
+    
+    if [ ! -d /usr/src/linux-$arch ]; then
+        prep_kernel_sources "$arch"
+    fi
+
+    cecho "-light_blue" "Configuring the kernel [$arch]..."
+    run_command "make -C /usr/src/linux-$arch $config 1>&3 2>&4" "[ -d /usr/src/linux-$arch ]" "" "" "fail_on_condition" ""
+    cecho "green" "OK"
+        
+    create_initramfs "$arch"
+
+    cecho "-light_blue" "Building $arch kernel version $(cat /usr/src/linux-$arch/include/config/kernel.release)..."
+    run_command "make -C /usr/src/linux-$arch -j$cores_num olddefconfig 1>&3 2>&4" "[ -d /usr/src/linux-$arch ]" "" "" "fail_on_condition" ""
+    run_command "make -C /usr/src/linux-$arch -j$cores_num modules 1>&3 2>&4" "[ -d /usr/src/linux-$arch ]" "" "" "fail_on_condition" ""
+    	mkdir -p  $initramfs_dir/lib/modules
+    	cp -r /lib/modules/$(cat /usr/src/linux-$arch/include/config/kernel.release) "$initramfs_dir"/lib/modules/
+    run_command "make -C /usr/src/linux-$arch -j$cores_num bzImage 1>&3 2>&4" "[ -d /usr/src/linux-$arch ]" "" "" "fail_on_condition" ""
+    cecho "green" "OK"
+
+    cecho "-light_blue" "Installing the kernel [$arch]..."
+	
+    get_dev_name "$serial_boot"
+    if eval [ -z "\${dev_$serial_boot:-}" ]; then
+        run_command "cp /usr/src/linux-$arch/arch/$arch/boot/bzImage $(pwd)/kernel+initramfs" "[ -f /usr/src/linux-$arch/arch/$arch/boot/bzImage ]" "Copying the bzImage to $(pwd)" "Failed to copy /usr/src/linux-$arch/arch/$arch/boot/bzImage to $(pwd)" "fail_on_condition" ""
+    else
+        run_command "make -C /usr/src/linux-$arch install 1>&3 2>&4" "[ -d /usr/src/linux-$arch ]" "" "" "fail_on_condition" ""
+        run_command "make -C /usr/src/linux-$arch modules_install 1>&3 2>&4" "[ -d /usr/src/linux-$arch ]" "" "" "fail_on_condition" ""
+    fi
+    cecho "green" "OK"
+}
+
+# checked
+function cecho {
+    if [ "$#" == "2" ]; then
+        local color="${1:-}"
+        local message="${2:-}"
+
+        local blue="\e[034m"
+        local default="\e[0m"
+        local green="\e[032m"
+        local light_blue="\e[094m"
+        local red="\e[031m"
+        local yellow="\e[033m"
+
+        if [ -n "$message" ]; then
+            if [ "$color" == "-blue" -o "$color" == "-green" -o "$color" == "-light_blue" -o "$color" == "-red" -o "$color" == "-yellow" ]; then
+                eval "echo -e -n \$${color#-}\$message\$default"
+            elif [ "$color" == "blue" -o "$color" == "green" -o "$color" == "light_blue" -o "$color" == "red" -o "$color" == "yellow" ]; then
+                eval "echo -e \$$color\$message\$default"
+            elif [ "$color" == "default" ]; then
+                eval "echo -e \$message"
+            else
+                cecho "red" "Please set the \"color\" argument for \"cecho\" function properly and try again, exiting!"
+                exit_error
+            fi
         else
-            cecho "no color has been specified, exiting!" "red"
-            exit 1
+            cecho "red" "Please set the \"message\" argument for \"cecho\" function properly and try again, exiting!"
+            exit_error
         fi
     else
-        cecho "No message has been specified, exiting!" "red"
-        exit 1
+        cecho "red" "[ $# != 2 ]\nPlease set the arguments for \"cecho\" function properly and try again, exiting!"
+        exit_error
     fi
+}
+
+function check_if_device_with_serial_exists {
+        check_number_of_arguments "check_if_device_with_serial_exists" "$#" "1"
+        local serial="${1:-}"
+        verbose "blue" "function check_if_device_with_serial_exists[serial: $serial]"
+        
+        if eval [ ! -b $(eval echo \${dev_$serial:-}) ]; then
+            get_dev_name "$serial"
+        fi
+        
+        until get_dev_name "$serial"; [ -b $(eval echo \${dev_$serial:-}) ]; do
+            cecho "yellow" "\nDevice with serial $serial not found, please make sure it is plugged in and the serial/uuid is set correctly, then press any key"
+            read
+        done
+}
+
+function check_number_of_arguments {
+    local function_name="${1:-}"
+    local number_of_arguments="${2:-}"
+    local number_of_arguments_expected="${3:-}"
+    check_if_argument_empty "$function_name" "$number_of_arguments" "$number_of_arguments_expected"
+    verbose "blue" "function check_number_of_arguments [ function_name: $function_name, number_of_arguments: $number_of_arguments, number_of_arguments_expected: $number_of_arguments_expected]"
+    if [ "$number_of_arguments" != "$number_of_arguments_expected" ]; then
+        cecho "red" "Number of arguments given[$number_of_arguments] doesn't equal number_of_arguments_expected[$number_of_arguments_expected], please set the arguments for \"$function_name\" function properly and try again, exiting!"
+        exit_error
+    fi
+}
+
+# checked
+function check_for_program {
+    check_number_of_arguments "check_for_program" "$#" "1"
+    local command="${1:-}"
+    local program=$(echo $command | cut -f1 -d " ")
+    check_if_argument_empty "command" "program"
+    verbose "blue" "function check_for_program [command: $command, program: $program]"
+
+    if ! ($command 1>&3 2>&4); then
+        cecho "red" "Please install $program and try again, exiting!"
+        exit_error
+    fi
+}
+
+# checked
+function check_if_argument_empty {
+    local args="${@:-}"
+    verbose "blue" "function check_if_argument_empty [args: $args]"
+
+    if [ -n "$args" ]; then
+        local arg
+        for arg in "$args"; do
+            if [ -z "$arg" ]; then
+                cecho "red" "[ ! -n $arg ]\nEmpty argument detected by  \"check_if_argument_empty\" function. Please set the arguments for the preceeding function correctly and try again, exiting!"
+                exit_error
+            fi
+        done
+    else
+        cecho "red" "[ ! -n $args ]\nNo arguments passed to  \"check_if_argument_empty\" function. Please set the arguments for the preceeding function correctly and try again, exiting!"
+        exit_error
+    fi
+}
+
+function check_install_options {
+    local memory=$(free -g | head -n2 | tail -n1 | awk '{ print $4 }')
+    if [ "$memory" -lt "$((${root_size%G} + 1))" -a ! -b "/dev/mapper/$serial_root" ]; then
+        cecho "red" "Less than ${root_size%G} + 1 GB of memory available and /dev/mapper/$serial_root not found, no install options available, exiting!"
+        exit_error
+    elif [ "$memory" -lt "$((${root_size%G} + 1))" -a -b "/dev/mapper/$serial_root" ]; then
+        cecho "default" "Less than ${root_size%G} + 1 GB of memory available, installing on /dev/mapper/$serial_root is the only option."
+        check_lvm "yes" "$root_lv"
+    elif [ "$memory" -ge "$((${root_size%G} + 1))" -a ! -b "/dev/mapper/$serial_root" ]; then
+        cecho "default" "More than ${root_size%G} + 1 GB of memory available and /dev/mapper/$serial_root not present, installing in RAMdisk is the only option."
+        mount_ramdisk "/mnt/laptop-root" "$root_size"
+        install_os "/mnt/laptop-root"
+    elif [ "$memory" -ge "$((${root_size%G} + 1))" -a -b "/dev/mapper/$serial_root" ]; then
+        cecho "default" "More than ${root_size%G} + 1 GB of memory available and /dev/mapper/$serial_root present. Would you like to install in RAM(d)isk or (r)ecreate LVM label/VG/LV on /dev/mapper/$serial_root and then do it?[d/r]"
+        local answer
+        read answer
+        while [ "$answer" != "d" -a "$answer" != "r" ]; do
+            cecho "yellow" "Please enter a correct answer![RAM(d)isk/(r)ecreate]"
+            read answer
+        done
+        if [ "$answer" == "d" ]; then
+            mount_ramdisk "/mnt/laptop-root" "$root_size"
+            install_os "/mnt/laptop-root"
+        elif [ "$answer" == "r" ]; then
+            check_lvm "yes" "$root_lv"
+        fi
+    fi
+}
+
+function check_lvm {
+    local recreate="${1:-}"
+    local vg_lv="${2:-}"
+    verbose "blue" "function check_lvm [recreate: $recreate, VG/LV: $vg_lv]"
+
+    local vg=${vg_lv%/*}
+    local lv=${vg_lv#*/}
+    check_if_argument_empty "$lv" "$recreate" "$vg" "$vg_lv"
+
+    check_for_program "lvm help"
+
+    cecho "-light_blue" "Checking for /dev/mapper/$serial_root..."
+    if [ -b "/dev/mapper/$serial_root" ]; then   
+        cecho "green" "OK"
+        cecho "-light_blue" "Checking for LVM label on /dev/mapper/$serial_root..."
+        if (lvm pvck /dev/mapper/"$serial_root" 1>&3 2>&4); then
+            cecho "green" "OK"
+            cecho "-light_blue" "Checking for $vg VG..."
+            if (lvm vgck "$vg" 1>&3 2>&4); then
+                cecho "green" "OK"
+                cecho "-light_blue" "Checking for $lv LVs..."
+                if (lvm lvs $vg_lv 1>&3 2>&4); then
+                    cecho "green" "OK"
+                    cecho "-light_blue" "Checking if $vg_lv Logical Volume is active..."
+                    if [ -b /dev/$vg_lv ]; then
+                        cecho "green" "OK"
+                    else
+                        cecho "-light_blue" "activating..."
+                        if DM_DISABLE_UDEV=1 lvm lvchange -ay $vg_lv 1>&3 2>&4; then
+                            cecho "green" "OK"
+                        else
+                            cecho "red" "FAILED!"
+                            check_install_options
+                        fi
+                    fi
+                else
+                    cecho "red" "NOT_FOUND!"
+                    cecho "default" "$lv LV has not been found in $vg VG, would you like to recreate?[no/yes]"
+                    get_answer
+                    if [ "$answer" == "yes" ]; then
+                        cecho "-light_blue" "Creating $vg_lv..."
+                        if [ "$lv" == "backup" ]; then
+                            run_command "lvm lvcreate -l$backup_size -n $lv $vg 1>&3 2>&4" "" "Creating $vg_lv" "Failed to create $vg_lv" "do_not_fail_on_condition" ""
+                        elif [ "$lv" == "root" ]; then
+                            run_command "lvm lvcreate -L$root_size -n $lv $vg 1>&3 2>&4" "" "Creating $vg_lv" "Failed to create $vg_lv" "do_not_fail_on_condition" ""
+                        fi
+                        cecho "green" "OK"
+                    else
+                        check_install_options
+                    fi
+                fi
+            else
+                cecho "red" "NOT_FOUND!"
+                if [ "$recreate" != "yes" ]; then
+                    check_install_options
+                else
+                    cecho "default" "$vg VG has not been found, would you like to create it?[no/yes]"
+                    get_answer
+                    if [ "$answer" == "yes" ]; then
+                        cecho "-light_blue" "Creating $vg VG on /dev/mapper/$serial_root..."
+                        run_command "lvm vgcreate $vg /dev/mapper/$serial_root 1>&3 2>&4" "" "Creating $vg VG on /dev/mapper/$serial_root" "Failed to create $vg VG on /dev/mapper/$serial_root" "fail_on_condition" ""
+                        cecho "green" "OK"
+                        check_lvm "$@"
+                    else
+                        check_install_options
+                    fi
+                fi
+            fi
+        else
+            cecho "red" "NOT_FOUND!"
+            if [ "$recreate" != "yes" ]; then
+                check_install_options
+            else
+                cecho "default" "LVM label not found on /dev/mapper/$serial_root, would you like to recreate it?[no/yes]"
+                get_answer
+                if [ "$answer" == "yes" ]; then
+                    if [ "$hardened" == "yes" ]; then
+                        erase_dev "/dev/mapper/$serial_root"
+                    fi
+                    cecho "-light_blue" "Creating LVM label on /dev/mapper/$serial_root..."
+                    run_command "lvm pvcreate /dev/mapper/$serial_root 1>&3 2>&4" "" "Creating LVM label on /dev/mapper/$serial_root" "Failed to create LVM label on /dev/mapper/$serial_root" "do_not_fail_on_condition" ""
+                    cecho "green" "OK"
+                    check_lvm "$@"
+                else
+                    check_install_options
+                fi
+            fi
+        fi
+    else
+        cecho "red" "NOT_FOUND!"
+        check_install_options
+    fi
+        
 }
 
 function check_status {
     local status="$?"
-    local error_message="${2:-}"
-    local resource="${1:-}"
-    
-    verbose "function check_status [error_message: $error_message, resource: $resource, status: $status]" "blue"
-    
+    check_number_of_arguments "check_status" "$#" "2"
+    local error_message="${1:-}"
+    local resource="${2:-}"
+    verbose "blue" "function check_status [resource: $resource, status: $status]"
+
     if [ "$status" == "0" ]; then
-        verbose "OK" "green"
+        verbose "green" "OK"
         if [ -n "$resource" ]; then
-            verbose "Adding $resource to the clean_up list" "blue"
+            verbose "blue" "Adding $resource to the clean_up list"
             resources_to_clean=$(echo "$resource ${resources_to_clean:-}")
         fi
     else
         if [ -z "$error_message" ]; then
-            cecho "Failed, exiting!" "red"
+            cecho "red" "Failed, exiting!"
         else
-            cecho "$error_message" "red"
+            cecho "red" "$error_message"
         fi
-        exit 1
+        exit 0
     fi
 }
 
-function check_for_program {        
-    local program=${1:-}
-    verbose "function check_for_program [program: $(echo $program | cut -f1 -d " ")]" "blue"
-    
-    run_command "$program &> /dev/null" "" "Checking for $(echo $program | cut -f1 -d ' ')" "0" ""
-}
-
-	function check_if_empty {
-        local arguments="${@:-}"
-        
-        verbose "function check_if_empty [arguments: $arguments]" "blue"
-        
-        if [ -n "$arguments" ]; then
-            local argument
-            for argument in "$arguments"; do
-                if [ -z "$argument" ]; then
-                    verbose "Argument empty, exiting!" "red"
-                    exit 1
-                fi
-            done
-        else
-            verbose "arguments empty, exiting!" "red"
-            exit 1
-        fi
-	}
-
-
+# checking
 function clean_up {
-    verbose "function clean_up"
-    
+    verbose "blue" "function clean_up"
+
     until [ -z $(echo ${resources_to_clean:-} | tr -d " ") ]; do
-        verbose "Resources to clean:${resources_to_clean:-}" "blue"
+        verbose "blue" "Resources to clean: ${resources_to_clean:-}"
         for resource in ${resources_to_clean:-}; do
-            if (mountpoint "$resource" &> /dev/null); then
+            if (mountpoint "$resource" 1>&3 2>&3); then
                 if [ "$resource" != "/mnt/laptop-root" ] && [ "$resource" != "/mnt/livedvd" ]; then
-                    verbose "[umount $resource]" "-b"
+                    verbose "-blue" "[umount $resource]"
                     umount "$resource"
-                    check_status
                     resources_to_clean=$(echo "${resources_to_clean:-}" | sed s:"$resource::")
                 else
                     resources_to_clean=$(echo "${resources_to_clean:-}" | sed s:"$resource::")
                 fi
             elif [ -d "$resource" ]; then
-                if [ "$resource" != "/boot" ]; then
-                    verbose "[rmdir $resource]" "-b"
+                #if [ "$resource" != "/boot" ]; then
+                verbose "-blue" "[rmdir $resource]"
+                if [ "$resource" == "/mnt/$serial_keys" ]; then                
+                    rm -rf "$resource"
+                else
                     rmdir "$resource"
-                    check_status
-                    resources_to_clean=$(echo "${resources_to_clean:-}" | sed s:"$resource::")
                 fi
-            elif (cryptsetup status /dev/mapper/$(basename "$resource") &> /dev/null); then
-                if [ "$resource" != "/dev/mapper/$serial_root" ]; then
-                    verbose "cryptsetup close $resource" "-b"
-                    cryptsetup close /dev/mapper/$(basename "$resource")
-                    check_status
+                    check_status "" ""
+                    resources_to_clean=$(echo "${resources_to_clean:-}" | sed s:"$resource::")
+                #fi
+            elif (cryptsetup status /dev/mapper/$(basename "$resource") 1>&3 2>&4); then
+                if [ "$resource" == "/dev/mapper/${serial_root:-}" ]; then
                     resources_to_clean=$(echo "${resources_to_clean:-}" | sed s:"$resource::")
                 else
+		    verbose "-blue" "cryptsetup close $resource"
+                    cryptsetup close /dev/mapper/$(basename "$resource")
+                    check_status "" ""
                     resources_to_clean=$(echo "${resources_to_clean:-}" | sed s:"$resource::")
                 fi
             elif [ $(ps aux | grep $resource | wc -l) -ge "2" ]; then
-                verbose "killing $resource" "-b"
+                verbose "-blue" "killing $resource"
                 killall $resource
-                check_status
+                check_status "" ""
+                while [ $(ps aux | grep $resource | wc -l) -ge "2" ]; do
+                    verbose "blue" "Waiting for $resource process to die..."
+                    sleep 1
+                done
                 resources_to_clean=$(echo "${resources_to_clean:-}" | sed s:"$resource::")
             elif [ -n "$(ifconfig | grep $resource)" ]; then
-                run_command "ifconfig $resource down" "" "Bringing $resource down" "0" ""
+                run_command "ifconfig $resource down" "" "" "Bringing $resource down" "fail_on_condition" ""
                 resources_to_clean=$(echo "${resources_to_clean:-}" | sed s:"$resource::")                
             else
-                verbose "Cleaning up $resource has failed!" "red"
+                verbose "red" "Cleaning up $resource has failed!"
             fi
         done
     done
 }
 
+# checked
 function configure_terminal {
-    verbose "function configure_terminal" "blue"
-    cecho "Configuring terminal..." "-lb"
+    verbose "blue" "function configure_terminal"
+    cecho "-light_blue" "Configuring terminal..."
 
-    run_command "set -o errexit" "" "Setting -o errexit" "0" ""
-    run_command "set -o noglob" "" "Setting -o noglob" "0" ""
-    run_command "set -o nounset" "" "Setting -o nounset" "0" ""
-    run_command "set -o pipefail" "" "Setting -o pipefail" "0" ""
-    
-    if [ "$debug" == "yes" ]; then
-        run_command "set -o verbose" "" "Setting -o verbose" "0" ""
+    if [ "$verbose" == "yes" ]; then
+        exec 3>/dev/null
+        if [ "$debug" == "yes" ]; then
+            exec 4>&2
+        elif [ "$debug" == "no" ]; then
+            exec 4>/dev/null
+        else
+            cecho "red" "Please set \"debug\" global variable in \"set_variables\" function and try again, exiting!"
+            exit_error
+        fi
+    elif [ "$verbose" == "no" ]; then
+        exec 3>/dev/null 4>/dev/null
+    else
+        cecho "red" "[ $verbose != no -a $verbose != yes ]\nPlease set the \"verbose\" global variable in the \"set_variables\" function properly and try again, exiting!"
+        exit_error
     fi
 
-    run_command "trap exit_trap EXIT" "" "Setting up EXIT trap" "0" ""
-    cecho "OK" "green"
+    run_command "set -o errexit" "" "" "Setting -o errorexit" "fail_on_condition" ""
+    run_command "set -o noglob" "" "" "Setting -o noglob" "fail_on_condition" ""
+    run_command "set -o nounset" "" "" "Setting -o nonset" "fail_on_condition" ""
+    run_command "set -o pipefail" "" "" "Setting -o pipefail" "fail_on_condition" ""
+
+    # # #
+    # Supported only by bash!
+    # # #
+    # if [ "$debug" == "yes" ]; then
+    #     run_command "set -o verbose" "" "" "Setting -o verbose" "fail_on_condition" ""
+    #     exec 3>&1
+    # elif [ "$debug" != "no" -a "$debug" != "yes" ]; then
+    #     cecho "red" "[ $debug != no -a $debug != yes ]\nPlease set the \"debug\" global variable properly and try again, exiting!"
+    #     exit_error
+    # fi
+    # # #
+    
+    trap exit_trap EXIT
+    
+    cecho "green" "OK"
+}
+
+function copy_executable {
+    check_number_of_arguments "copy_executable" "$#" "2"
+    local destination="${1:-}"
+    local executable="${2:-}"
+    check_if_argument_empty "$destination" "$executable"
+
+    check_for_program "which which"
+    local location=$(which $executable)
+    
+    verbose "blue" "function copy_executable [destination: $destination, executable: $executable]"
+    
+    if [ -x "$location" ]; then
+        if (ldd $location 1>&3 2>&4); then
+            verbose "blue" "$location is a dynamic executable, additional files will be copied"
+            check_for_program "ldd --version"
+            for file in $(lddtree -l $location); do
+                run_command "mkdir -p $destination${file%/*}" "[ ! -d $destination${file%/*} ]" "" "Creating $destination${file%/*} directory" "do_not_fail_on_condition" ""
+                cp $file $destination$file
+            done
+        else
+            verbose "-blue" "Copying $location to $destination$location"
+            run_command "mkdir -p $destination${location%/*}" "[ ! -d $destination${location%/*} ]" "" "Creating $destination${location%/*} directory" "do_not_fail_on_condition" ""
+            cp $location $destination$location
+        fi
+    fi
+}
+
+function copy_executables {
+    check_number_of_arguments "copy_executables" "$#" "2"
+    local destination="${1:-}"
+    local executables="${2:-}"
+    check_if_argument_empty "$destination" "$executables"
+
+    verbose "blue" "function copy_executable [destination: $destination, executable: $executables]"
+
+    for executable in $executables; do
+        copy_executable "$destination" "$executable"
+    done
 }
 
 function create_dirs {
-    verbose "function create_dirs"
+    destination="${1:-}"
+    dirs="${2:-}"
+    verbose "blue" "function create_dirs [destination: $destination, dirs: $dirs]"
+    check_if_argument_empty "$destination" "$dirs"
     
-    dirs="$@"
-    
-	for directory in $dirs; do
-        if [ -d "$initramfs_temp$directory" ]; then
-            verbose "Directory $initramfs_temp$directory already exists, skipping" "blue"
+    for directory in $dirs; do
+        if [ -d "$destination/$directory" ]; then
+            verbose "blue" "Directory $destination/$directory already exists, skipping"
         else
-            verbose "Creating directory $initramfs_temp$directory" "-b"
-            mkdir "$initramfs_temp""$directory"
-            check_status
+            verbose "-blue" "Creating directory $destination/$directory"
+            mkdir -p "$destination"/"$directory"
+            check_status "" ""
         fi
     done
 }
 
 function create_initramfs {
-    verbose "function create_initramfs[$(echo $@)]"
+    check_number_of_arguments "create_initramfs" "$#" "1"
+    local arch="${1:-}"
+    verbose "blue" "function create_initramfs [arch: $arch]"
+    check_if_argument_empty "$arch"
+
+    initramfs_dir="/usr/src/linux-$arch/initramfs"
+
+    local kernel_config="CONFIG_INITRAMFS_SOURCE=\"/usr/src/linux-$arch/initramfs\"\n\
+CONFIG_INITRAMFS_ROOT_UID=0\n\
+CONFIG_INITRAMFS_ROOT_GID=0\n\
+CONFIG_INPUT_TOUCHSCREEN=n"
+
+    local initramfs_dirs="dev etc home mnt opt $(if [ -n "$initramfs_keys" ]; then echo "$keys_dir"; fi) proc sys"
+    local initramfs_files="busybox \
+                           dd \
+                           mkfs.ext4 \
+                           sg_vpd"
     
-    #initramfs_dirs="/bin /dev /etc  /lib /lib/firmware /lib64 /mnt /mnt/root /proc /run /sbin /sys /usr/bin /usr/lib64 /usr/share /usr/share/udhcpc /var /var/www /var/www/cgi-bin"
-    local initramfs_dirs="/bin /dev /etc /mnt /mnt/ /proc /sbin /sys"
-    #initramfs_files="/etc/shadow /sbin/dhclient /bin/bash /bin/dd /bin/echo /bin/lsblk /bin/nano /sbin/cryptsetup /sbin/lvm /sbin/mdadm /usr/bin/mc /usr/bin/strace /usr/bin/curl  /lib/ld-linux.so.3 /lib/libc.so.6  /lib64/libresolv.so.2"
-    local initramfs_files="/bin/busybox /usr/bin/sg_vpd /bin/dd /sbin/mkfs.ext4"
-    
-    if [ "$initramfs_internet" == "yes" ]; then
-        # network/internet/DNS
-        local initramfs_dirs=$(echo "$initramfs_dirs /lib64 /usr /usr/share /usr/share/udhcpc") 
-        local initramfs_files=$(echo "$initramfs_files /etc/host.conf /etc/hosts /etc/ld.so.cache /etc/nsswitch.conf /etc/resolv.conf /lib64/libnss_dns.so.2 /lib64/libnss_files.so.2 /usr/share/udhcpc/default.script")
-        
-        # wpa_supplicant
-        local initramfs_dirs=$(echo "$initramfs_dirs /etc/wpa_supplicant /lib /lib/firmware /usr /usr/lib64 /usr/sbin") 
-        local initramfs_files=$(echo "$initramfs_files /etc/wpa_supplicant/wpa_supplicant.conf /lib/firmware/iwlwifi-6000g2a-5.ucode /lib/firmware/mt7601u.bin /usr/sbin/wpa_supplicant")
-        
-        laptop_config=$(echo -e "$laptop_config\nCONFIG_IWLWIFI=y\nCONFIG_IWLDVM=y\nCONFIG_IWLMVM=n\nCONFIG_IWLWIFI_DEBUG=n\nCONFIG_IWLWIFI_DEVICE_TRACING=n\nCONFIG_MT7601U=y")
-        
-        #squashfs
-        laptop_config=$(echo -e "$laptop_config\nCONFIG_SQUASHFS=y\nCONFIG_SQUASHFS_FILE_CACHE=y\nCONFIG_SQUASHFS_FILE_DIRECT=n\nCONFIG_SQUASHFS_DECOMP_SINGLE=y\nCONFIG_SQUASHFS_DECOMP_MULTI=n\nCONFIG_SQUASHFS_DECOMP_MULTI_PERCPU=n\nCONFIG_SQUASHFS_XATTR=y\nCONFIG_SQUASHFS_ZLIB=y\nCONFIG_SQUASHFS_LZ4=y\nCONFIG_SQUASHFS_LZO=y\nCONFIG_SQUASHFS_XZ=y\nCONFIG_SQUASHFS_4K_DEVBLK_SIZE=y\nCONFIG_SQUASHFS_EMBEDDED=n")        
-    fi
-
-    if [ "$initramfs_tools" == "yes" ]; then
-        # cryptsetup
-        local initramfs_dirs=$(echo "$initramfs_dirs /lib64 /sbin /usr/ /usr/lib64") 
-        local initramfs_files=$(echo "$initramfs_files /sbin/cryptsetup")
-        laptop_config=$(echo -e "$laptop_config\nCONFIG_CRYPTO_XTS=y\nCONFIG_DM_CRYPT=y")
-
-        # curl
-        local initramfs_dirs=$(echo "$initramfs_dirs /lib64 /usr/ /usr/bin /usr/lib64") 
-        local initramfs_files=$(echo "$initramfs_files /usr/bin/curl")
-
-        # KVM
-        laptop_config=$(echo -e "$laptop_config\nCONFIG_KVM=y\nCONFIG_KVM_INTEL=y\nCONFIG_KVM_AMD=n\nCONFIG_KVM_MMU_AUDIT=n\nCONFIG_KVM_DEVICE_ASSIGNMENT=n\nCONFIG_VHOST_NET=y\nCONFIG_TUN=y\nCONFIG_BRIDGE=y\nCONFIG_BRIDGE_NF_EBTABLES=n\nCONFIG_BRIDGE_IGMP_SNOOPING=y")
-
-        # lsblk
-        local initramfs_dirs=$(echo "$initramfs_dirs /lib64") 
-        local initramfs_files=$(echo "$initramfs_files /bin/lsblk")
-        
-        # lspci
-        local initramfs_dirs=$(echo "$initramfs_dirs /etc/udev /usr /usr/sbin /usr/share /usr/share/misc") 
-        local initramfs_files=$(echo "$initramfs_files /etc/udev/hwdb.bin /usr/sbin/lspci /usr/share/misc/pci.ids /usr/share/misc/pci.ids.gz")
-        
-        # lsusb
-        local initramfs_dirs=$(echo "$initramfs_dirs /etc/udev /usr /usr/bin/ /usr/share /usr/share/misc")
-        local initramfs_files=$(echo "$initramfs_files /etc/udev/hwdb.bin /usr/bin/lsusb /usr/share/misc/pci.ids /usr/share/misc/pci.ids.gz")
-        
-        # lvm
-        local initramfs_dirs=$(echo "$initramfs_dirs /lib64")
-        local initramfs_files=$(echo "$initramfs_files /sbin/lvm")
-
-        # SAS
-        laptop_config=$(echo -e "$laptop_config\nCONFIG_FUSION=y\nCONFIG_FUSION_SPI=y\nCONFIG_FUSION_SAS=y\nCONFIG_FUSION_MAX_SGE=128\nCONFIG_FUSION_CTL=y\nCONFIG_FUSION_LOGGING=y")
-
-        # strace
-        local initramfs_dirs=$(echo "$initramfs_dirs /usr /usr/bin") 
-        local initramfs_files=$(echo "$initramfs_files /usr/bin/strace")
+    if [ "$initramfs_dns" == "yes" ]; then
+        local initramfs_files="$initramfs_files \
+                                /etc/host.conf \
+                                /etc/hosts \
+                                /etc/ld.so.cache \
+                                /etc/nsswitch.conf \
+                                /etc/resolv.conf \
+                                /lib64/libnss_dns.so.2 \
+                                /lib64/libnss_files.so.2 \
+                                /usr/share/udhcpc/default.script"
     fi
     
-    local initramfs_temp="/usr/src/$(readlink /usr/src/linux)-$kernel_type/initramfs"
+    if [ "$initramfs_wireless" == "yes" ]; then
+        local initramfs_files="$initramfs_files \
+                                /etc/wpa_supplicant/wpa_supplicant.conf \
+                                /lib/firmware/ath9k_htc \
+                                /lib/firmware/ath9k_htc/htc_7010-1.4.0.fw \
+                                /lib/firmware/ath9k_htc/htc_9271-1.4.0.fw \
+                                /lib/firmware/iwlwifi-6000g2a-5.ucode \
+                                /lib/firmware/mt7601u.bin \
+                                /usr/sbin/wpa_supplicant"
 
-    mount_dev "$initramfs_temp" "100M"
-	create_dirs "$initramfs_dirs"
-	
-    if [ "$initramfs_include_keys" == "yes" ]; then
-        create_dirs "/opt /opt/keys"
-        open_luks "$serial_keys" "serial"
-        mount_dev "$serial_keys"
-        mount_dev "$serial_root"
+        local kernel_config="$kernel_config\n\
+CONFIG_ATH9K_BTCOEX_SUPPORT=n\n\
+CONFIG_ATH9K_HTC=y\n\
+CONFIG_ATH9K_HTC_DEBUGFS=n\n\
+CONFIG_IWLWIFI=y\n\
+CONFIG_IWLDVM=y\n\
+CONFIG_IWLMVM=n\n\
+CONFIG_IWLWIFI_DEBUG=n\n\
+CONFIG_IWLWIFI_DEVICE_TRACING=n\n\
+CONFIG_MT7601U=y"
     fi
 
-    if [ -c "$initramfs_temp"/dev/console ]; then
-        verbose "$initramfs_temp/dev/console already exists!" "red"
-    else
-        verbose "Creating $initramfs_temp/dev/console" "-b"
-        mknod -m 600 "$initramfs_temp"/dev/console c 5 1
-        check_status
+    if [ "$initramfs_b43" == "yes" ]; then
+        local kernel_config="$kernel_config\n\
+CONFIG_B43=m\n\
+CONFIG_B43_PHY_LP=y\n\
+CONFIG_B43_DEBUG=y\n\
+CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE=y"
     fi
 
-    if [ -f "$initramfs_temp"/etc/mtab ]; then
-        verbose "$initramfs_temp/etc/mtab already exists!" "red"
-    else
-        verbose "Creating $initramfs_temp/etc/mtab" "-b"
-        touch "$initramfs_temp"/etc/mtab
-        check_status
+    if [ "$initramfs_usb_tethering" == "yes" ]; then
+        local kernel_config="$kernel_config\n\
+CONFIG_USB_USBNET=y\n\
+CONFIG_USB_NET_CDCETHER=y\n\
+CONFIG_USB_NET_CDCEEM=y\n\
+CONFIG_USB_NET_RNDIS_HOST=y\n\
+CONFIG_USB_NET_CDC_SUBSET=y\n\
+CONFIG_USB_ARMLINUX=y"
     fi
 
-    
-	verbose "Creating $initramfs_temp/init" "-b"
-	echo '#!/bin/busybox sh
-	
-function cecho {
-    local color=${2:-default}
-    local message="${1:-}"
-            
-    local blue="\e[034m"
-    local default="\e[0m"
-    local green="\e[032m"
-    local light_blue="\e[094m"
-    local red="\e[031m"
-    local yellow="\e[033m"
-    
-    if [ -n "$message" ]; then
-        if [ "$color" == "-b" ]; then
-            eval "echo -e -n \${blue}${message}\$default"
-        elif [ "$color" == "-d" ]; then
-            eval "echo -e -n \$message"
-        elif [ "$color" == "-g" ]; then
-            eval "echo -e -n \${green}${message}\$default"
-        elif [ "$color" == "-lb" ]; then
-            eval "echo -e -n \${light_blue}${message}\$default"
-        elif [ "$color" == "-r" ]; then
-            eval "echo -e -n \${red}${message}\$default"
-        elif [ "$color" == "-y" ]; then
-            eval "echo -e -n \${yellow}${message}\$default"
-        elif [ "$color" == "blue" -o "$color" == "green" -o "$color" == "light_blue" -o "$color" == "red" -o "$color" == "yellow" ]; then
-            eval "echo -e \${$color}${message}\$default"
-        elif [ "$color" == "default" ]; then
-            eval "echo -e $message"
+    if [ "$initramfs_r8169" == "yes" ]; then
+        local kernel_config="$kernel_config\n\
+CONFIG_R8169=y"
+    fi
+
+    if [ "$initramfs_dell_t7500_audio" == "yes" ]; then
+        local kernel_config="$kernel_config\n\
+CONFIG_SND_HDA_CODEC_ANALOG=y"
+    fi
+
+    if [ "$initramfs_dell_t7500_card_reader" == "yes" ]; then
+        local kernel_config="$kernel_config\n\
+CONFIG_USB_UAS=y"
+    fi
+
+    if [ "$initramfs_uvc_camera" == "yes" ]; then
+        local kernel_config="$kernel_config\n\
+CONFIG_MEDIA_SUPPORT=m\n\
+CONFIG_USB_GSPCA=n\n\
+CONFIG_MEDIA_USB_SUPPORT=y\n\
+CONFIG_MEDIA_CAMERA_SUPPORT=y\n\
+CONFIG_MEDIA_ANALOG_TV_SUPPORT=n\n\
+CONFIG_MEDIA_DIGITAL_TV_SUPPORT=n\n\
+CONFIG_MEDIA_RADIO_SUPPORT=n\n\
+CONFIG_MEDIA_SDR_SUPPORT=n\n\
+CONFIG_MEDIA_RC_SUPPORT=n\n\
+CONFIG_MEDIA_CEC_SUPPORT=n\n\
+CONFIG_VIDEO_ADV_DEBUG=n\n\
+CONFIG_VIDEO_FIXED_MINOR_RANGES=n\n\
+CONFIG_MEDIA_PCI_SUPPORT=n\n\
+CONFIG_USB_VIDEO_CLASS=m"
+    fi
+
+    if [ "$initramfs_sdhci" == "yes" ]; then
+        local kernel_config="$kernel_config\n\
+CONFIG_MMC=y\n\
+CONFIG_MMC_SDHCI=y\n\
+CONFIG_MMC_SDHCI_PCI=y\n\
+CONFIG_MMC_SDHCI_ACPI=y\n\
+CONFIG_MMC_SDHCI_PLTFM=y"
+    fi
+
+    if [ "$initramfs_squashfs" == "yes" ]; then
+        local kernel_config="$kernel_config\n\
+CONFIG_SQUASHFS=y\n\
+CONFIG_SQUASHFS_FILE_CACHE=n\n\
+CONFIG_SQUASHFS_FILE_DIRECT=y\n\
+CONFIG_SQUASHFS_DECOMP_SINGLE=n\n\
+CONFIG_SQUASHFS_DECOMP_MULTI=n\n\
+CONFIG_SQUASHFS_DECOMP_MULTI_PERCPU=y\n\
+CONFIG_SQUASHFS_XATTR=y\n\
+CONFIG_SQUASHFS_ZLIB=y\n\
+CONFIG_SQUASHFS_LZ4=y\n\
+CONFIG_SQUASHFS_LZO=y\n\
+CONFIG_SQUASHFS_XZ=y\n\
+CONFIG_SQUASHFS_4K_DEVBLK_SIZE=y\n\
+CONFIG_SQUASHFS_EMBEDDED=n"
+        local initramfs_files="$initramfs_files \
+                                /usr/bin/unsquashfs"
+    fi
+
+    if [ "$initramfs_cryptsetup" == "yes" ]; then
+        local initramfs_files="$initramfs_files \
+                                /sbin/cryptsetup"
+        local kernel_config="$kernel_config\n\
+CONFIG_CRYPTO_XTS=y\n\
+CONFIG_DM_CRYPT=y"
+    fi
+
+    if [ "$initramfs_curl" == "yes" ]; then
+        local initramfs_files="$initramfs_files \
+                                /usr/bin/curl"
+    fi
+
+    if [ "$initramfs_docker" == "yes" ]; then
+        local kernel_config="$kernel_config\n\
+CONFIG_CGROUP_DEVICE=y\n\
+CONFIG_MEMCG=y\n\
+CONFIG_VETH=y\n\
+CONFIG_BRIDGE_NETFILTER=y\n\
+CONFIG_NF_NAT=y\n\
+CONFIG_NF_NAT_IPV4=y\n\
+CONFIG_IP_NF_TARGET_MASQUERADE=y\n\
+CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y\n\
+CONFIG_IP_NF_NAT=y\n\
+CONFIG_USER_NS=y\n\
+CONFIG_CGROUP_PIDS=y\n\
+CONFIG_MEMCG_SWAP=y\n\
+CONFIG_MEMCG_SWAP_ENABLED=y\n\
+CONFIG_BLK_CGROUP=y\n\
+CONFIG_DEBUG_BLK_CGROUP=y\n\
+CONFIG_BLK_DEV_THROTTLING=y\n\
+CONFIG_BLK_DEV_THROTTLING_LOW=n\n\
+CONFIG_CFQ_GROUP_IOSCHED=y\n\
+CONFIG_CGROUP_PERF=y\n\
+CONFIG_CGROUP_HUGETLB=y\n\
+CONFIG_NET_CLS_CGROUP=y\n\
+CONFIG_CFS_BANDWITH=y\n\
+CONFIG_RT_GROUP_SCHED=y\n\
+CONFIG_IP_VS=y\n\
+CONFIG_IP_VS_IPV6=n\n\
+CONFIG_IP_VS_DEBUG=n\n\
+CONFIG_IP_VS_TAB_BITS=12\n\
+CONFIG_IP_VS_SH_TAB_BITS=8\n\
+CONFIG_IP_VS_FTP=n\n\
+CONFIG_IP_VS_NFCT=n\n\
+CONFIG_IP_VS_PE_SIP=n\n\
+CONFIG_IP_VS_PROTO_TCP=y\n\
+CONFIG_IP_VS_PROTO_UDP=y\n\
+CONFIG_IP_VS_PROTO_ESP=n\n\
+CONFIG_IP_VS_PROTO_AH=n\n\
+CONFIG_IP_VS_PROTO_SCTP=n\n\
+CONFIG_IP_VS_RR=n\n\
+CONFIG_IP_VS_WRR=n\n\
+CONFIG_IP_VS_LC=n\n\
+CONFIG_IP_VS_WLC=n\n\
+CONFIG_IP_VS_FO=n\n\
+CONFIG_IP_VS_OVF=n\n\
+CONFIG_IP_VS_LBLC=n\n\
+CONFIG_IP_VS_LBLCR=n\n\
+CONFIG_IP_VS_DH=n\n\
+CONFIG_IP_VS_SH=n\n\
+CONFIG_IP_VS_SED=n\n\
+CONFIG_IP_VS_NQ=n\n\
+CONFIG_IP_VS_NFCT=y\n\
+CONFIG_VXLAN=y\n\
+CONFIG_IPVLAN=y\n\
+CONFIG_GENEVE=n\n\
+CONFIG_GTP=n\n\
+CONFIG_MACVLAN=y\n\
+CONFIG_MACVTAP=n\n\
+CONFIG_DUMMY=y\n\
+CONFIG_CGROUP_NET_PRIO=y\n\
+CONFIG_DM_THIN_PROVISIONING=y\n\
+CONFIG_DM_DEBUG_BLOCK_STACK_TRACING=n"
+    fi
+
+    if [ "$initramfs_fuse" == "yes" ]; then
+        kernel_config="$kernel_config\n
+CONFIG_FUSE_FS=y"
+    fi
+
+    if [ "$initramfs_kvm" == "yes" ]; then
+        kernel_config="$kernel_config\n
+CONFIG_KVM=y\n\
+CONFIG_KVM_INTEL=y\n\
+CONFIG_KVM_AMD=n\n\
+CONFIG_KVM_MMU_AUDIT=n\n\
+CONFIG_KVM_DEVICE_ASSIGNMENT=n\n\
+CONFIG_VHOST_NET=y\n\
+CONFIG_TUN=y\nCONFIG_BRIDGE=y\n\
+CONFIG_BRIDGE_NF_EBTABLES=n\n\
+CONFIG_BRIDGE_IGMP_SNOOPING=y"
+    fi
+
+    if [ "$initramfs_lsblk" == "yes" ]; then
+        local initramfs_files="$initramfs_files \
+                                /bin/lsblk"
+    fi
+
+    if [ "$initramfs_lspci" == "yes" ]; then
+        local initramfs_files="$initramfs_files \
+                                /etc/udev/hwdb.bin \
+                                /usr/sbin/lspci \
+                                /usr/share/misc/pci.ids \
+                                /usr/share/misc/pci.ids.gz"
+    fi
+
+    if [ "$initramfs_lsusb" == "yes" ]; then
+        local initramfs_files="$initramfs_files \
+                                /etc/udev/hwdb.bin \
+                                /usr/bin/lsusb \
+                                /usr/share/misc/pci.ids \
+                                /usr/share/misc/pci.ids.gz"
+    fi
+
+    if [ "$initramfs_lvm" == "yes" ]; then
+        local initramfs_files="$initramfs_files \
+                                /sbin/lvm"
+        kernel_config="$kernel_config\n\
+CONFIG_DM_DEBUG_BLOCK_MANAGER_LOCKING=n"
+    fi
+
+    if [ "$initramfs_mdadm" == "yes" ]; then
+        local initramfs_files="$initramfs_files \
+                                /sbin/mdadm"
+    fi
+
+    if [ "$initramfs_nv" == "yes" ]; then
+        kernel_config="$kernel_config\n\
+# .config
+CONFIG_IKCONFIG=y\n\
+CONFIG_IKCONFIG_PROC=y\n\
+# nvidia-drivers
+CONFIG_ZONE_DMA=y\n\
+CONFIG_MTRR=y\n\
+CONFIG_SYSVIPC=y"
+    fi
+
+    if [ "$initramfs_pbzip2" == "yes" ]; then
+        local initramfs_files="$initramfs_files \
+                                pbzip2 \
+                                tar"
+    fi
+
+    if [ "$initramfs_pigz" == "yes" ]; then
+        local initramfs_files="$initramfs_files \
+                                pigz \
+                                tar"
+    fi
+
+    if [ "$initramfs_raid1" == "yes" ]; then
+        local kernel_config="$kernel_config\n\
+CONFIG_MD_RAID1=y"
+    fi
+
+    if [ "$initramfs_dm_raid" == "yes" ]; then
+        local kernel_config="$kernel_config\n\
+CONFIG_DM_RAID=y"
+    fi
+
+    if [ "$initramfs_raid6" == "yes" ]; then
+        local kernel_config="$kernel_config\n\
+CONFIG_MD_RAID456=y\n\
+CONFIG_ASYNC_RAID6_TEST=n"
+    fi
+
+    if [ "$initramfs_rsync" == "yes" ]; then
+        local initramfs_files="$initramfs_files \
+                                /usr/bin/rsync"
+    fi
+
+    if [ "$initramfs_sas" == "yes" ]; then
+        local kernel_config="$kernel_config\n\
+CONFIG_FUSION=y\n\
+CONFIG_FUSION_SPI=y\n\
+CONFIG_FUSION_SAS=y\n\
+CONFIG_FUSION_MAX_SGE=128\n\
+CONFIG_FUSION_CTL=y\n\
+CONFIG_FUSION_LOGGING=y"
+    fi
+
+    if [ "$initramfs_strace" == "yes" ]; then
+        local initramfs_files="$initramfs_files \
+                                /usr/bin/strace"
+    fi
+
+    echo -e "$kernel_config" >> /usr/src/linux-$arch/.config
+
+    mount_ramdisk "$initramfs_dir" "ramfs"
+# clean up? Not necessarry? mkdir -p and mount filesystems?
+    create_dirs "$initramfs_dir" "$initramfs_dirs"
+    copy_executables "$initramfs_dir" "$initramfs_files"
+
+    get_dev_name "$serial_keys"
+    if [ -n "$initramfs_keys" ]; then
+        if [ -b "$(eval echo \${dev_$serial_keys:-})" ]; then
+            open_luks "$serial_keys"
+            mount_dev "/dev/mapper/$serial_keys"
+            mount_dev "$initramfs_keys"
         else
-            cecho "no color has been specified, exiting!" "red"
-            exit 1
+            cecho "-light_blue" ".."
+            cecho "green" "OK"
+            #gen_keys "$serial_keys" "$initramfs_keys"
+            #mount_dev "$initramfs_keys"
         fi
-    else
-        cecho "No message has been specified, exiting!" "red"
-        exit 1
     fi
+
+    run_command "mknod -m 600 $initramfs_dir/dev/console c 5 1" "[ ! -c $initramfs_dir/dev/console ]" "Failed creating /dev/console, already exists!" "Creating /dev/console." "fail_on_condition" ""
+    run_command "touch $initramfs_dir/etc/mtab" "[ ! -f $initramfs_dir/etc/mtab ]" "Failed creating $initramfs_dir/etc/mtab, already exists!" "Creating $initramfs_dir/etc/mtab." "fail_on_condition" ""
+    run_command "cp $0 $initramfs_dir/cu_boot.sh" "[ ! -f $initramfs_dir/cu_boot.sh ]" "Failed creating $initramfs_dir/cu_boot.sh, already exists!" "Creating $initramfs_dir/cu_boot.sh" "fail_on_condition" ""
+    run_command "ln -s cu_boot.sh $initramfs_dir/init" "[ ! -f $initramfs_dir/init ]" "Failed creating $initramfs_dir/init link, already exists!" "Creating $initramfs_dir/init link" "fail_on_condition" ""
+    }
+
+function create_partitions {
+    serial="$1"
+    verbose "blue" "function create_partitions [serial: $serial]"
+
+    if eval [ -z \${dev_$serial:-} ]; then
+        get_dev_name "$serial"
+    fi
+
+    verbose "-blue" "Searching for 128MB boot partition"
+    if [ $(eval "blockdev --getsz \${dev_$serial}1") == "251200" ]; then
+        check_status "" ""
+    else
+        echo -e "o\nn\np\n1\n2048\n+128M\nN\na\n1\nw" | eval "fdisk \$dev_$serial"
+        sleep 1
+    fi
+    sleep 5
 }
 
-function check_if_empty {
-        local arguments="${@:-}"
-        
-        verbose "function check_if_empty [arguments: $arguments]" "blue"
-        
-        if [ -n "$arguments" ]; then
-            local argument
-            for argument in "$arguments"; do
-                if [ -z "$argument" ]; then
-                    verbose "Argument empty, exiting!" "red"
-                    exit 1
+function del_key {
+    local serial="${1:-}"
+    verbose "yellow" "function del_key[serial: $serial]"
+    check_if_argument_empty "$serial"
+
+    local key_names=""
+    if [ -z "$key_names" ]; then
+        cecho "light_blue" "Available keys:"
+        list_keys /mnt/"$serial_keys"
+        echo "Please enter key name(s) [aaa bbb] to delete"
+        read key_names
+        while [ -z "$key_names" ]; do
+            cecho "yellow" "no key name provided, please try again"
+            read key_names
+        done
+    fi
+
+    local key_name
+    for key_name in $key_names; do
+        if [ -d /mnt/"$serial"/"$key_name" ]; then
+            cecho "-light_blue" "Deleting key $key_name..."
+            run_command "rm -r /mnt/$serial/$key_name" "" "" "Deleteing key $key_name" "fail_on_condition" ""
+            cecho "green" "OK"
+        else
+            cecho "yellow" "key $key_name not found, please try again"
+        fi
+    done
+}
+
+function exit_error {
+    verbose "blue" "function error_exit"
+    cecho "red" "Press ENTER to continue..."
+    exit 0
+}
+
+function exit_trap {
+    local exit_code="$?"
+    verbose "red" "function exit_trap [$exit_code]"
+
+    if [ "$verbose" == "yes" -a "$exit_code" == "0" ]; then
+        verbose "blue" "Exiting gracefully"
+    elif [ "$verbose" == "yes" -a "$exit_code" != "0" ]; then
+        verbose "yellow" "A command has exited with code [$exit_code], dropping into a shell"; exec sh
+    elif [ "$exit_code" != "0" ]; then
+        cecho "red" "An error has occured, please enable verbose mode for more information and try again"
+        exec sh
+    fi
+
+    clean_up
+}
+
+# checked
+function erase_dev {
+    local devices="$@"
+    verbose "blue" "function erase_dev [devices: $devices]"
+    check_if_argument_empty "$devices"
+
+    check_for_program "/bin/dd --version"
+
+    if [ "$devices" == "choose" ]; then
+        lsblk -o+serial
+        while (local device; for device in $devices; do [ ! -b $device ]; done); do
+            cecho "default" "Please enter space separated list of devices to erase."
+            read devices
+        done
+    fi
+
+    get_dev_geometry "$devices"
+
+    if [ "$hardened" == "no" ]; then
+        verbose "blue" "[ hardened=no ], using /dev/zero"
+        local source=/dev/zero
+    elif [ "$hardened" == "yes" ]; then
+        verbose "blue" "[ hardened=yes ], using /dev/urandom"
+        local source=/dev/urandom
+    else
+        cecho "red" "[ $hardened !=no -a $hardened != yes ]\nPlease set \"hardened\" variable properly and try again, exiting!"
+        exit_error
+    fi
+            
+    for device in $devices; do
+        if (/bin/dd count=1 if=/dev/zero of=/dev/null status=progress 1>&3 2>&4); then
+            local dd_opts="oflag=direct status=progress"
+        fi
+
+        local block_count=$(eval echo \$sector_count_$(basename $device))
+        local block_size=$(eval echo \$block_size_$(basename $device))
+        cecho "default" "About to erase device $device with $block_count ${block_size}B blocks using $source, would you like to continue? [no/yes]"
+        get_answer
+        if [ "$answer" == "yes" ]; then
+            cecho "light_blue" "Erasing device $device with $block_count ${block_size}B blocks using $source..."
+            /bin/dd if=$source of=$device bs=$block_size count=$block_count ${dd_opts:-}
+            cecho "green" "OK"
+        elif [ "$answer" == "no" ]; then
+            cecho "red" "Operation aborted, exiting!"
+            exit_error
+        else
+            cecho "red" "[ $answer != no -a $answer!= yes ]\nInvalid value of \"answer\" variable returned, exiting!"
+            exit_error
+        fi
+    done
+}
+
+# checked
+function format_dev {
+    if [ "$#" == "2" ]; then
+
+        local device="${1:-}"
+        local fstype="${2:-}"
+        verbose "blue" "function format_dev [device: $device, filesystem: $fstype]"
+
+        check_if_argument_empty "$device" # [ -b ... ]?
+        verbose "blue" "Using $device"
+
+        if [ -z "$fstype" ]; then
+            cecho "default" "\nPlease choose the file system type to use[ext2/ext4/luks]:"
+            local fstype
+            read fstype
+            while [ "${fstype:-}" != "ext2" -a "${fstype:-}" != "ext4" -a "${fstype:-}" != "luks" ]; do
+                cecho "yellow" "Incorrect filesystem type has been chosen [$fstype], please choose [ext2/ext4/luks]!"
+                read fstype
+            done
+            format_dev "$device" "$fstype"
+        elif [ "$fstype" == "ext2" -o "$fstype" == "ext4" ]; then
+#            check_for_program " --help" # busybox?
+            if (eval "fsck.$fstype $device" 1>&3 2>&4); then
+                cecho "default" "The device $device seems to already be formatted, would you like to format anyway [no/yes]?"
+                get_answer
+                run_command "mkfs.$fstype -q $device" "[ -b $device ] && [ $answer == yes ]" "Failed to format $device with $fstype" "Formatting $device with $fstype" "do_not_fail_on_condition" ""
+            else
+                run_command "mkfs.$fstype -q $device" "[ -b $device ]" "" "Formatting $device as $fstype" "fail_on_condition" ""
+            fi
+        elif [ "$fstype" == "luks" ]; then
+            check_for_program "cryptsetup --version"
+            if eval cryptsetup isLuks $device; [ "$?" == "0" ]; then
+                cecho "default" "$device seems to be already LUKS formatted, would you like to format anyway [no/yes]?"
+                get_answer
+                if [ "$answer" == "no" ]; then
+                    cecho "yellow" "Skipping $device"
+                    return 0
                 fi
+            fi
+            cecho "light_blue" "Formatting device $device as LUKS..."
+            until cryptsetup luksFormat $device; do
+                cecho "yellow" "cryptsetup has failed, please try again"
             done
         else
-            verbose "arguments empty, exiting!" "red"
-            exit 1
+            cecho "red" "Please set the \"fstype\" argument for \"format_dev\" function properly and try again, exiting!"
+            exit_error
         fi
-	}
-	
-function check_for_program {        
-    local program=${1:-}
-    verbose "function check_for_program [program: $(echo $program | cut -f2 -d " ")]" "blue"
-    
-    run_command "$program &> /dev/null" "" "Checking for $(echo $program | cut -f1 -d '"'"' '"'"')" "0" ""
-}
-
-function mount_root {
-    local vg_lv="${1:-}"
-    verbose "function mount_root [VG/LV: $vg_lv]"
-    
-    check_if_empty "$vg_lv"
-    
-    cecho "Checking the root filesystem integrity" "-lb"
-    if (fsck /dev/"$vg_lv"); then
-        cecho "OK" "green"
     else
-        cecho "Filesystem integrity check has failed, would you like to re-create from backup?[no/yes]" "default"
-        get_answer
-        run_command "restore_root $vg_lv ${vg_lv}_backup yes" "[ $answer == yes ]" "Restoring $vg_lv volume from ${vg_lv}_backup" "0" ""
-        mount_root "$@"
-	fi
-	if (mountpoint /mnt/laptop-root); then
-        verbose "/mnt/root already mounted, skipping" "blue"
-    else
-        mount_dev $(echo $vg_lv | sed s:/:-:)
+        cecho "red" "Please set the arguments for \"format_dev\" function properly and try again, exiting!"
+        exit_error
     fi
 }
 
+function gen_keys {
+        check_number_of_arguments "gen_keys" "$#" "2"
+        local key_drive_serial="${1:-}"
+        local key_names="${2:-}"
+
+        verbose "blue" "function gen_keys [key_drive_serial: $key_drive_serial, key_names: $key_names]"
+        check_if_argument_empty "$key_drive_serial"
+        check_for_program "cryptsetup --version"
+
+        while [ -z "$key_names" ]; do
+            get_dev_name "none"
+            local device
+            for device in $(ls /sys/block | grep -e dm -e loop -v); do
+                local device_listed="no"
+                if [ -n "$(eval echo \${serial_vpd_pg80_$device:-})" ]; then
+                    if [ "$device_listed" == "no" ]; then
+                        cecho "yellow" "${device}:"
+                        device_listed="yes"
+                    fi
+                    cecho "yellow" "$(eval echo \${serial_vpd_pg80_$device:-} from /sys/block/$device/device/vpd_pg80)"
+                fi
+                if [ -n "$(eval echo \${serial_lsblk_$device:-})" ]; then
+                    if [ "$device_listed" == "no" ]; then
+                        cecho "yellow" "${device}:"
+                        device_listed="yes"
+                    fi
+                    cecho "yellow" "$(eval echo \${serial_lsblk_$device:-} from lsblk -o+serial)"
+                fi
+                if [ -n "$(eval echo \${serial_sg_vpd_$device:-})" ]; then
+                    if [ "$device_listed" == "no" ]; then
+                        cecho "yellow" "${device}:"
+                        device_listed="yes"
+                    fi
+                    cecho "yellow" "$(eval echo \${serial_sg_vpd_$device:-} from sg_vpd -p sn -r /dev/$device)"
+                fi
+                if [ -n "$(eval echo \${serial_mdadm_$device:-})" ]; then
+                    if [ "$device_listed" == "no" ]; then
+                        cecho "yellow" "${device}:"
+                        device_listed="yes"
+                    fi
+                    cecho "yellow" "$(eval echo \${serial_mdadm_$device:-} from mdadm -D /dev/$device\n)"
+                fi
+            done
+            cecho "default" "Please enter key name(s) [aaa bbb]"
+            read key_names
+        done
+
+        if [ -z "$key_names" ] && [ -n "$(ls -A /mnt/$key_drive_serial | sed 's/lost+found//')" ]; then
+            cecho "light_blue" "Existing keys:"
+            list_keys /mnt/$key_drive_serial
+        fi
+
+        if [ "$hardened" == "no" ]; then
+            local device="/dev/urandom"
+        elif [ "$hardened" == "yes" ]; then
+            local device="/dev/random"
+        else
+            cecho "red" "Please set \"hardened\" variable in \"set_variables\" function correctly and try again, exiting!"
+            exit_error
+        fi
+
+#        if [ -n "$password" ]; then
+#            run_command "mkdir -p /mnt/$serial_keys" "[ ! -f /mnt/$serial_keys ]" "" "" "fail_on_condition" "/mnt/$serial_keys"
+#        fi
+        if [ ! -d "/mnt/$key_drive_serial" ]; then
+            run_command "mkdir /mnt/$key_drive_serial" "[ ! -d /mnt/$key_drive_serial ]" "Failed to create /mnt/$key_drive_serial, already exists!" "Creating /mnt/$key_drive_serial..." "fail_on_condition" "/mnt/$key_drive_serial"
+        fi
+
+        local key_name
+        for key_name in $key_names; do
+            if [ ! -d /mnt/"$key_drive_serial"/"$key_name" ]; then
+                cecho "-light_blue" "Generating $key_name key..."
+                run_command "mkdir /mnt/$key_drive_serial/$key_name" "[ ! -d /mnt/$key_drive_serial/$key_name ]" "Failed to create /mnt/$key_drive_serial/$key_name!" "Creating /mnt/$key_drive_serial/$key_name directory" "fail_on_condition" ""
+
+                run_command "dd if=/dev/zero of=/mnt/$key_drive_serial/$key_name/$key_name bs=1k count=1032" "[ ! -f /mnt/$key_drive_serial/$key_name/$key_name ]" "Failed to create /mnt/$key_drive_serial/$key_name/$key_name directory, already exists!" "Creating /mnt/$key_drive_serial/$key_name/$key_name directory..." "fail_on_condition" ""
+
+#                if [ -n "$password" ]; then
+#                    run_command "echo $password | cryptsetup luksFormat --align-payload=2056 --key-file - -q /mnt/$key_drive_serial/$key_name/$key_name" "[ -f /mnt/$key_drive_serial/$key_name/$key_name ]" "Failed to format /mnt/$key_drive_serial/$key_name/$key_name as LUKS" "Formatting /mnt/$key_drive_serial/$key_name/$key_name as LUKS" "fail_on_condition" ""
+                    
+#                    run_command "echo $password | cryptsetup luksOpen --key-file - /mnt/$key_drive_serial/$key_name/$key_name key_$key_name" "[ -f /mnt/$key_drive_serial/$key_name/$key_name ]" "Failed to open /mnt/$key_drive_serial/$key_name/$key_name as LUKS" "Openning /mnt/$key_drive_serial/$key_name/$key_name as LUKS" "fail_on_condition" "key_$key_name"
+#                else
+                    if (/bin/dd count=1 if=/dev/zero of=/dev/null status=progress 1>&3 2>&4); then
+                        local dd_opts="status=progress"
+                    fi
+                    
+                    run_command "/bin/dd if=$device of=/mnt/$key_drive_serial/$key_name/$key_name.key bs=1 count=4096 ${dd_opts:-}" "[ ! -f /mnt/$key_drive_serial/$key_name/$key_name.key ]" "Failed to create /mnt/$key_drive_serial/$key_name/$key_name.key, already exists!" "Creating /mnt/$key_drive_serial/$key_name/$key_name.key..." "fail_on_condition" ""
+                    
+                    run_command "cryptsetup luksFormat --use-urandom --align-payload=2056 --key-file /mnt/$key_drive_serial/$key_name/$key_name.key -q /mnt/$key_drive_serial/$key_name/$key_name" "[ -f /mnt/$key_drive_serial/$key_name/$key_name.key ] && [ -f /mnt/$key_drive_serial/$key_name/$key_name ]" "Failed to format /mnt/$key_drive_serial/$key_name/$key_name as LUKS" "Formatting /mnt/$key_drive_serial/$key_name/$key_name as LUKS" "fail_on_condition" ""
+                    
+                    run_command "cryptsetup luksOpen --key-file /mnt/$key_drive_serial/$key_name/$key_name.key /mnt/$key_drive_serial/$key_name/$key_name key_$key_name" "[ -f /mnt/$key_drive_serial/$key_name/$key_name.key ] && [ -f /mnt/$key_drive_serial/$key_name/$key_name ]" "Failed to open /mnt/$key_drive_serial/$key_name/$key_name as LUKS" "Openning /mnt/$key_drive_serial/$key_name/$key_name as LUKS" "fail_on_condition" "key_$key_name"
+#                fi
+
+# improve?
+                if [ -f $key_name ] && [ -f "$key_name".header ]; then
+                    cecho  "-light_blue" "Importing $(pwd)/$key_name..."
+                    dd if="$key_name" of=/dev/mapper/key_"$key_name" bs=1 count=4096 1>&2 2>&4
+                    cecho  "-light_blue" "$(pwd)/$key_name.header..."
+                    cp "$key_name".header /mnt/"$key_drive_serial"/"$key_name"/"$key_name".header
+                else
+                    run_command "/bin/dd if=$device of=/dev/mapper/key_$key_name bs=1 count=4096 ${dd_opts:-}" "[ -b /dev/mapper/key_$key_name ]" "Failed to create the key material for a key named $key_name, the file exists!" "Creating the key material for the key named $key_name" "fail_on_condition" ""
+                    run_command "dd if=/dev/zero of=/mnt/$key_drive_serial/$key_name/$key_name.header bs=1k count=1028 1>&3 2>&4" "[ -b /dev/mapper/key_$key_name ]" "Failed to create the header for the key named $key_name" "Creating key header for the key named $key_name" "fail_on_condition" ""
+#                    if [ -n "$password" ]; then
+#                    ls /dev/mapper/ -l
+#                    ls /mnt/$key_drive_serial/$key_name -l
+#                        run_command "cryptsetup luksFormat --header /mnt/$key_drive_serial/$key_name/$key_name.header --key-file /dev/mapper/key_$key_name -q /dev/loop0" "[ -f /mnt/$key_drive_serial/$key_name/$key_name.header ] && [ -b /dev/mapper/key_$key_name ]" "Failed to store the key material for key $key_name" "Storing the key material for the key $key_name" "fail_on_condition" "/mnt/$key_drive_serial/$key_name"
+#                    else
+                        run_command "cryptsetup luksFormat --use-urandom --header /mnt/$key_drive_serial/$key_name/$key_name.header --key-file /dev/mapper/key_$key_name -q /dev/loop0" "[ -f /mnt/$key_drive_serial/$key_name/$key_name.header ] && [ -b /dev/mapper/key_$key_name ]" "Failed to store the key material for key $key_name" "Storing the key material for the key $key_name" "fail_on_condition" "" # check
+#                    fi
+                fi
+                cecho "green" "OK"
+            else
+                cecho "yellow" "key $key_name already exists, please choose (a) different name(s)"
+                gen_keys "$@"
+            fi
+        done
+}
+
+# checked
 function get_answer {
-    answer=""
-    while [ "${answer:-}" != "no" -a "${answer:-}" != "yes" ]; do
-        cecho "Please choose the correct answer[no/yes]!" "red"
+    read answer
+    while [ "$answer" != "no" -a "$answer" != "yes" ]; do
+        cecho "yellow" "Please type in a correct answer[no/yes]!"
         read answer
     done
 }
 
-	function check_lvm {
-        local vg_lv="${1:-}"
-        
-        verbose "function check_lvm [VG/LV: $vg_lv]" "blue"
-        
-        check_if_empty "$vg_lv"
-        check_for_program "lvm help"
-        
-        cecho "Checking for LVM label on $serial_root" "-lb"
-        if (lvm pvck /dev/mapper/"$serial_root"); then
-            cecho "OK" "green"
-            cecho "Checking for VG $(echo $vg_lv | cut -d / -f 1)" "-lb"
-            if (lvm vgck $(echo $vg_lv | cut -d "/" -f 1) &> /dev/null); then
-                cecho "OK" "green"
-                cecho "Checking for LV $vg_lv" "-lb"
-                if (lvm lvs $vg_lv); then
-                    cecho "OK" "green"
-                    run_command "lvm lvchange -ay $vg_lv &> /dev/null" "[ ! -b /dev/$vg_lv ]" "Activating $vg_lv" "permissive" ""
-                else
-                    cecho "root LV has not been found, would you like to re-create? [no/yes]" "default"
-                    get_answer
-                    run_command "lvm lvcreate -L25G -n $(echo $vg_lv | cut -d / -f 2) $(echo $vg_lv | cut -d / -f 1)" "[ $answer == yes ]" "Re-creating $(echo $vg_lv | cut -d / -f 2) LV on $(echo $vg_lv | cut -d / -f 1) VG" "0" ""
-                    run_command "lvm lvcreate -L25G -n $(echo $vg_lv | cut -d / -f 2) $(echo ${vg_lv}backup | cut -d / -f 1)" "[ $answer == yes ]" "Re-creating $(echo $vg_lv | cut -d / -f 2) LV on $(echo $vg_lv | cut -d / -f 1) VG" "0" ""
-                    check_lvm "$@"
-                fi
-            else
-                cecho "$(echo $vg_lv | cut -d / -f 1) VG has not been found, would you like to re-create? [no/yes]" "default"
-                get_answer
-                run_command "lvm vgcreate $(echo $vg_lv | cut -d / -f 1) /dev/mapper/$serial_root" "[ $answer == yes ]" "Re-creating $(echo $vg_lv | cut -d / -f 1) VG on /dev/mapper/$serial_root" "0" ""
-                check_lvm "$@"
-            fi
-        else
-            local memory=$(free -m | head -n2 | tail -n1 | awk '"'"'{ print $4 }'"'"')
-            if [ "$memory" -gt "2500" ]; then
-                verbose "LVM label not found, more than 2500MiB system memory available $memory. Would you like to run Gentoo from a liveDVD, install it in a RAMdisk or re-create?[livedvd/ramdisk/re-create]" "default"
-                local answer=""
-                read answer
-                while [ "${answer:-}" != "livedvd" -a "${answer:-}" != "ramdisk" -a "${answer:-}" != "re-create" ]; do
-                    cecho "Please enter correct answer![livedvd/ramdisk/re-create]" "yellow"
-                    read answer
-                done
-                if [ "$answer" == "livedvd" ]; then
-                    mount_dev "/mnt/livedvd" "2500M"
-                    run_gentoo "/mnt/root"
-                elif [ "$answer" == "ramdisk" ]; then
-                    mount_dev "/mnt/laptop-root" "2500M"
-                    install_gentoo "/mnt/laptop-root"
-                elif [ "$answer" == "re-create" ]; then
-                    #erase_dev "$serial_root" "luks"
-                    run_command "lvm pvcreate /dev/mapper/$serial_root" "[ -b /dev/mapper/$serial_root ]" "Creating LVM label on /dev/mapper/$serial_root" "0" ""
-                    run_command "lvm vgcreate $(echo $vg_lv | cut -d / -f 1) /dev/mapper/$serial_root" "lvm pvck /dev/mapper/$serial_root" "Creating $(echo $vg_lv | cut -d / -f 1) VG on /dev/mapper/$serial_root" "0" ""
-                    run_command "lvm lvcreate -L25G -n $(echo $vg_lv | cut -d / -f 2) $(echo $vg_lv | cut -d / -f 1)" "lvm vgck $(echo $vg_lv | cut -d / -f 1)" "Re-creating $(echo $vg_lv | cut -d / -f 2) LV on $(echo $vg_lv | cut -d / -f 1) VG" "0" ""
-                    run_command "lvm lvcreate -L25G -n $(echo $vg_lv | cut -d / -f 2)_backup $(echo $vg_lv | cut -d / -f 1)" "lvm lvs $vg_lv" "Re-creating $(echo $vg_lv | cut -d / -f 2)_backup LV on $(echo $vg_lv | cut -d / -f 1) VG" "0" ""
-                    check_lvm "$@"
-                fi
-            else
-                verbose "LVM label not found, would you like to re-create?[no/yes]" "default"
-                    get_answer
-                    #erase_dev "$serial_root" "luks"
-                    run_command "lvm pvcreate /dev/mapper/$serial_root" "[ -b /dev/mapper/$serial_root ]" "Creating LVM label on /dev/mapper/$serial_root" "0" ""
-                    run_command "lvm vgcreate $(echo $vg_lv | cut -d / -f 1) /dev/mapper/$serial_root" "lvm pvck /dev/mapper/$serial_root" "Creating $(echo $vg_lv | cut -d / -f 1) VG on /dev/mapper/$serial_root" "0" ""
-                    run_command "lvm lvcreate -L25G -n $(echo $vg_lv | cut -d / -f 2) $(echo $vg_lv | cut -d / -f 1)" "lvm vgck $(echo $vg_lv | cut -d / -f 1)" "Re-creating $(echo $vg_lv | cut -d / -f 2) LV on $(echo $vg_lv | cut -d / -f 1) VG" "0" ""
-                    run_command "lvm lvcreate -L25G -n $(echo $vg_lv | cut -d / -f 2)_backup $(echo $vg_lv | cut -d / -f 1)" "lvm lvs $vg_lv" "Re-creating $(echo $vg_lv | cut -d / -f 2)_backup LV on $(echo $vg_lv | cut -d / -f 1) VG" "0" ""
-                    check_lvm "$@"
-            fi
-        fi
-    }
-    
-function check_status {
-    local status="$?"
-    local error_message="${2:-}"
-    local resource="${1:-}"
-    
-    verbose "function check_status [error_message: $error_message, resource: $resource, status: $status]" "blue"
-    
-    if [ "$status" == "0" ]; then
-        verbose "OK" "green"
-        if [ -n "$resource" ]; then
-            verbose "Adding $resource to the clean_up list" "blue"
-            resources_to_clean=$(echo "$resource ${resources_to_clean:-}")
-        fi
-    else
-        if [ -z "$error_message" ]; then
-            cecho "Failed, exiting!" "red"
-        else
-            cecho "$error_message" "red"
-        fi
-        exit 1
-    fi
-}
-    
-function clean_up {
-    verbose "function clean_up"
-    
-    until [ -z $(echo ${resources_to_clean:-} | tr -d " ") ]; do
-        verbose "Resources to clean:${resources_to_clean:-}" "blue"
-        for resource in ${resources_to_clean:-}; do
-            if (mountpoint "$resource" &> /dev/null); then
-                if [ "$resource" != "/mnt/laptop-root" ] && [ "$resource" != "/mnt/livedvd" ]; then
-                    verbose "[umount $resource]" "-b"
-                    umount "$resource"
-                    check_status
-                    resources_to_clean=$(echo "${resources_to_clean:-}" | sed s:"$resource::")
-                else
-                    resources_to_clean=$(echo "${resources_to_clean:-}" | sed s:"$resource::")
-                fi
-            elif [ -d "$resource" ]; then
-                if [ "$resource" != "/boot" ]; then
-                    verbose "[rmdir $resource]" "-b"
-                    rmdir "$resource"
-                    check_status
-                    resources_to_clean=$(echo "${resources_to_clean:-}" | sed s:"$resource::")
-                fi
-            elif (cryptsetup status /dev/mapper/$(basename "$resource") &> /dev/null); then
-                if [ "$resource" != "/dev/mapper/$serial_root" ]; then
-                    verbose "cryptsetup close $resource" "-b"
-                    cryptsetup close /dev/mapper/$(basename "$resource")
-                    check_status
-                    resources_to_clean=$(echo "${resources_to_clean:-}" | sed s:"$resource::")
-                else
-                    resources_to_clean=$(echo "${resources_to_clean:-}" | sed s:"$resource::")
-                fi
-            elif [ $(ps aux | grep $resource | wc -l) -gt "1" ]; then
-                cecho "$(ps aux | grep $resource)" "red"
-                verbose "killing $resource" "-b"
-                killall $resource
-                check_status
-                while [ $(ps aux | grep $resource | wc -l) -gt "1" ]; do
-                    cecho "waiting..." "red"
-                    sleep 1
-                done
-                resources_to_clean=$(echo "${resources_to_clean:-}" | sed s:"$resource::g")
-                cecho "$(ps aux | grep $resource)" "red"
-            elif [ -n "$(ifconfig | grep $resource)" ]; then
-                run_command "ifconfig $resource down" "" "Bringing $resource down" "0" ""
-                resources_to_clean=$(echo "${resources_to_clean:-}" | sed s:"$resource::")                
-            else
-                verbose "Cleaning up $resource has failed!" "red"
-                exit 1
-            fi
-        done
-    done
-}
-
-    function configure_network {
-        while [ -z $(ls /sys/class/net | grep $late_net_iface) ]; do
-            verbose "Waiting for device $late_net_iface" "blue"
-            sleep 1
-        done
-        
-        local wired_device=$(ls /sys/class/net | grep eth)
-        local wireless_device=$(ls /sys/class/net | grep wlan)
-        
-        verbose "function configure_network [net_devices: $(ls /sys/class/net), wired_device: $wired_device, wireless_device: $wireless_device]" "blue"
-
-    	check_for_program "wpa_supplicant -v"
-        
-        if [ -n "$wireless_device" ] && [ -f /etc/wpa_supplicant/wpa_supplicant.conf ]; then
-            run_command "wpa_supplicant -Dnl80211 -i$wireless_device -c/etc/wpa_supplicant/wpa_supplicant.conf &" "" "Starting wpa_supplicant" "0" "wpa_supplicant"
-            run_command "udhcpc -i $wireless_device &>/dev/null &" "" "Starting udhcpc DHCP client on $wireless_device" " 0" "udhcpc"
-        else
-            verbose "device [$wireless_device] does not exist or configuration file missing, could not start wpa_supplicant" "yellow"
-        fi
-        
-        if [ $(ps aux | grep udhcpc | wc -l) -lt "2" ]; then
-            local udhcpc=udhcpc
-        fi
-        
-        run_command "udhcpc -i $wired_device &>/dev/null &" "[ -n "$wired_device" ]" "Starting udhcpc DHCP client on $wired_device"  "0" "${udhcpc:-}"
-
-}
-
-function configure_terminal {
-    verbose "function configure_terminal" "blue"
-    cecho "Configuring terminal..." "-lb"
-
-    run_command "set -o errexit" "" "Setting -o errexit" "0" ""
-    run_command "set -o noglob" "" "Setting -o noglob" "0" ""
-    run_command "set -o nounset" "" "Setting -o nounset" "0" ""
-    run_command "set -o pipefail" "" "Setting -o pipefail" "0" ""
-    
-    if [ "$debug" == "yes" ]; then
-        run_command "set -o verbose" "" "Setting -o verbose" "0" ""
-    fi
-
-    run_command "trap exit_trap EXIT" "" "Setting up EXIT trap" "0" ""
-    cecho "OK" "green"
-}
-        
-function verbose {
-    local color=${2:-default}
-    local message="${1:-}"
-
-    if [ "$verbose" == "yes" ]; then
-        cecho "$message" "$color"
-    elif [ "$verbose" != "no" ] && [ "$verbose" != "yes" ]; then
-        cecho "verbose not set to [no/yes], exiting!" "red"
-        exit 1
-    fi
-}
-
-     function erase_dev {
-        local serial="${1:-}"
-        local type="${2:-}"
-        
-        verbose "function erase_dev [serial: $serial, type: $type]" "blue"
-
-        check_if_empty "$serial"
-        
-        if [ "$hardened" == "yes" ]; then
-            verbose "hardened=yes, using /dev/urandom" "blue"
-            local source=/dev/urandom
-        elif [ "$hardened" == "no" ]; then
-            verbose "hardened=no, using /dev/zero" "blue"
-            local source=/dev/zero
-        else
-            cecho "hardened variable not set to [no/yes], exiting!" "red"
-            exit 1
-        fi
-
-        get_dev_geometry "$serial"
-
-        if [ "$type" == "luks" ]; then
-            local device=/dev/mapper/$serial
-        else
-            local device=$(eval "echo /dev/\$dev_$serial")
-        fi
-        
-        verbose "using device $device" "blue"
-        
-        check_for_program "/bin/dd --version"
-        
-        if (dd count=1 if=/dev/zero of=/dev/null status=progress &> /dev/null); then
-            local dd_opts="status=progress"
-        fi
-        cecho "About to erase $device, please confirm with [ENTER]" "yellow"
-        read
-        cecho "Erasing device $device with $(eval echo \$sector_count_$serial) 512B sectors using $source..." "blue"
-#        run_command "/bin/dd if=$source of=$device bs=512 count=\$sector_count_$serial ${dd_opts:-}" "[ -b $device ]" "0" ""
-        run_command "/bin/dd if=$source of=$device bs=512 count=1 ${dd_opts:-}" "[ -b $device ]" "0" ""
-        cecho "OK" "green"
-    }
-
-	function exit_trap {
-		local exit_code="$?"
-		
-        verbose "function exit_trap [$exit_code]"
-
-        if [ "$verbose" == "yes" ]; then
-            if [ "$exit_code" == "0" ]; then verbose "Exiting gracefully"; else verbose "Something went wrong, starting terminal!" "red"; setsid cttyhack sh; fi
-        else
-            if [ "$exit_code" != "0" ]; then echo "Script error has occured[$exit_code], please enable verboseging for more information"; fi
-        fi
-        clean_up
-    }
-    
-function format_dev {
-    local ser_or_dev="${1:-}"
-    local filesystem="${2:-}"
-    verbose "function format_dev[ serial or device: $ser_or_dev, file system: $filesystem ]"
-
-	if eval [ -b /dev/mapper/"$ser_or_dev" ]; then
-		local device="/dev/mapper/$ser_or_dev"
-	elif eval [ -b /dev/"$ser_or_dev" ]; then
-		local device="/dev/$ser_or_dev"
-	elif eval "[ -b /dev/\$dev_$ser_or_dev ]"; then
-		local device="/dev/\$dev_$ser_or_dev"
-	fi
-	verbose "Using $device" "blue"
-	
-	if [ -z "$filesystem" ]; then
-        local fstype
-        while [ "${fstype:-}" != "ext2" -a "${fstype:-}" != "ext4" ]; do
-            echo "Please choose filesystem type[ext2/ext4]."
-            read fstype
-        done
-        verbose "Formatting $device with $fstype"
-        eval mkfs."$fstype" "$device" > /dev/null
-	elif [ "$filesystem" == "ext2" ]; then
-        if (eval "fsck $device"); then
-            verbose "echo $device seems to already formatted, would you like to format again[no/yes]?" "blue"
-			local answer
-            read answer
-			if [ "$answer" == "yes" ]; then
-                eval "mkfs.ext2 -q $device"
-			elif [ "$answer" != "no" -a "$answer" != "yes" ]; then
-				format_dev "$@"
-			fi
-        else
-            run_command "eval mkfs.ext2 -q $device" "" "Formatting $device as ext2" "0" ""
-        fi
-	elif [ "$filesystem" == "ext4" ]; then
-		verbose "Formatting $device with ext4 filesystem"
-        local fstype=$(eval "blkid -o value -s TYPE $device")
-        if [ "$fstype" == "ext4" ]; then
-            verbose "echo $device seems to already formatted, would you like to format again[yes/no]?" "blue"
-			local answer="no"
-            $(read -t 1 -p no answer; true)
-            #echo answer:$answer
-			if [ "$answer" == "yes" ]; then
-                eval "mkfs.ext4 -q $device"
-			elif [ "$answer" != "yes" -a "$answer" != "no" ]; then
-				format_dev "$@"
-			fi
-        else
-            eval "mkfs.ext4 -q $device"
-        fi
-	elif [ "$filesystem" == "luks" ]; then
-		local exit_code=$(eval "cryptsetup isLuks $device"; echo "$?")
-		if [ "$exit_code" == "0" ]; then
-			verbose "$device seems to be a LUKS device already, would you like to format anyway[no/yes]?" "blue"
-			local answer="no"
-            $(read -t 1 answer; true)
-			if [ "$answer" == "yes" ]; then
-				run_command "cryptsetup luksFormat $device" "" "Formatting $device as LUKS" "$device" "0" ""
-			elif [ "$answer" != "yes" -a "$answer" != "no" ]; then
-				format_dev "$@"
-			fi
-		else
-            run_command "cryptsetup luksFormat $device" "" "Formatting $device as LUKS" "0" ""
-		fi
-	fi
-}
-
+# checked
 function get_dev_geometry {
-    serial=${1:-}
-    check_if_empty "$serial"
-	verbose "function get_dev_geometry [serial: $serial]" "blue"
+    devices="$@"
+	verbose "blue" "function get_dev_geometry [devices: $devices]"
+
+	check_if_argument_empty "$devices"
 	
-	get_dev_name "$@"
-	
-	for serial in $@; do
-		verbose "Obtaining sector count for $serial" "blue"
-		local sector_count=$(eval "blockdev --getsz /dev/\$dev_$serial")
-		export sector_count_$serial="$sector_count"
+	local device
+	for device in $devices; do
+        cecho "-light_blue" "Obtaining drive geometry for device $device..."
+
+		verbose "-blue" "Obtaining block size..."
+		local block_size=$(eval "blockdev --getbsz $device")
+		export block_size_$(basename $device)="$block_size"
+		cecho "-light_blue" "${block_size}B x "
+
+		verbose "-blue" "Obtaining sector count..."
+		local sector_count=$(eval "blockdev --getsz $device")
+		if [ "$block_size" == "512" ]; then
+            export sector_count_$(basename $device)="$sector_count"
+            cecho "-light_blue" "${sector_count}..."
+		elif [ "$block_size" == "2048" ]; then
+            export sector_count_$(basename $device)="$(($sector_count/4))"
+            cecho "-light_blue" "$(($sector_count/4))..."
+		elif [ "$block_size" == "4096" ]; then
+            export sector_count_$(basename $device)="$(($sector_count/8))"
+            cecho "-light_blue" "$(($sector_count/8))..."
+        else
+            cecho "red" "Block size $block_size not supported, exiting!"
+            exit_error
+        fi
 	done
+	cecho "green" "OK"
 }
 
 function get_dev_name {
-        local serials=${@:-}
-        verbose "function get_dev_name [serials: $serials]" "blue"
-        check_if_empty "$serials"
+    local serials="${@:-}"
+    verbose "blue" "function get_dev_name [serials: $serials]"
+    check_if_argument_empty "$serials"
+    
+    for serial in $serials; do
+        if [ "$serials" != "none" ]; then
+            cecho "-light_blue" "Searching for device with serial $serial..."
+        elif [ "$serials" == "none" ]; then
+            cecho "yellow" "You might find the below, automatically detected serial numbers helpful:"
+        fi
         
-        check_for_program "lsblk --version"
-        check_for_program "sg_vpd --help"
-        
-        sleep 2
-        
-        for serial in $serials; do
-            local found="0"
-
-            cecho "Searching for device with serial $serial..." "-lb"
-            local device
-            for device in $(ls /sys/block/); do
-                verbose "Trying $device" "blue"
-                if [ -n "$(cat /sys/block/$device/device/vpd_pg80 2>/dev/null | cut -c2- | tail -n1 | tr -d '"'"'[:space:]'"'"')" ]; then
-                    local serial2=$(cat /sys/block/$device/device/vpd_pg80 | cut -c2- | tail -n1 | tr -d '"'"'[:space:]'"'"')
-                    if [ "$serial" == "$serial2" ]; then
-                        verbose "Found device: $device, serial: $serial, serial2: $serial2 from vpd_pg80" "blue"
-                        export dev_$serial="$device"
+        local device
+        local found="0"
+        for device in $(ls /sys/block/ | grep -v loop); do
+            verbose "blue" "Obtaining serial for $device."
+            if [ "$found" == "0" ]; then
+                if [ -n "$(cat /sys/block/$device/device/vpd_pg80 2>&4 | cut -c2- | tail -n1 | tr -d '[:space:]')" ]; then
+                    local serial_vpd_pg80=$(cat /sys/block/$device/device/vpd_pg80 | cut -c2- | tail -n1 | tr -d '[:space:]')
+                    verbose "blue" "Found $serial_vpd_pg80 via vpd_pg80."
+                    if [ "$serial" != "none" -a "$serial" == "$serial_vpd_pg80" ]; then
+                        verbose "blue" "[ $serial == $serial_vpd_pg80 ]"
                         found="1"
-                        continue
+                        export dev_$serial="/dev/$device"
+                        break
+                    elif [ "$serial" != "none" -a "$serial" != "$serial_vpd_pg80" ]; then
+                        verbose "blue" "[ $serial != $serial_vpd_pg80 ]"
+                    elif [ "$serial" == "none" -a -n "$serial_vpd_pg80" ]; then
+                        export serial_vpd_pg80_$device="$serial_vpd_pg80"
                     fi
-                elif [ -n "$(lsblk -ndoname,serial | grep $device | awk '"'"'{print $2}'"'"')" ] && [ "$found" == "0" ]; then
-                    local serial2=$(lsblk -ndoname,serial | grep $device | awk '"'"'{print $2}'"'"')
-                    verbose "Found device: $device, serial: $serial, serial2: $serial2 from lsblk" "blue"
-                    if [ "$serial" == "$serial2" ]; then
-                        verbose "Found device: $device, serial: $serial, serial2: $serial2 from lsblk" "blue"
-                        export dev_$serial="$device"
-                        found="1"
-                        continue
-                    fi
-                elif (sg_vpd /dev/$device &> /dev/null) && [ "$found" == "0" ]; then
-                    serial2="$(sg_vpd -p sn -r /dev/$device)"
-                    serial2=$(echo "$serial2" | cut -c4- | rev | cut -c2- | rev)
-                    if [ "$serial" == "$serial2" ]; then
-                        verbose "Found device: $device, serial: $serial, serial2: $serial2 from sg_vpd" "blue"
-                        export dev_$serial="$device"
-                        found="1"
-                        continue
-                    fi
+                else
+                    verbose "blue" "Failed $serial via vpd_pg80"       
                 fi
-            done
-
-            if [ "$found" == "1" ]; then
-                check_status
-            else
-                check_status "" "Device with serial $serial not found!"
+                if [ -n "$(lsblk -ndoname,serial | grep $device | awk '{print $2}')" ]; then
+                    local serial_lsblk=$(lsblk -ndoname,serial | grep $device | awk '{print $2}')
+                    verbose "blue" "Found serial $serial_lsblk via lsblk."
+                    if [ "$serial" != "none" -a "$serial" == "$serial_lsblk" ]; then
+                        verbose "blue" "[ $serial == $serial_lsblk ]"
+                        found="1"
+                        export dev_$serial="/dev/$device"
+                        break
+                    elif [ "$serial" != "none" -a "$serial" != "$serial_lsblk" ]; then
+                        verbose "blue" "[ $serial != $serial_lsblk ]"
+                    elif [ "$serial" == "none" -a -n "$serial_lsblk" ]; then
+                        export serial_lsblk_$device="$serial_lsblk"
+                    fi
+                else
+                    verbose "blue" "Failed $serial via lsblk"
+                fi
+                if (sg_vpd -p sn -r /dev/$device 1>&3 2>&4); then
+                    serial_sg_vpd="$(sg_vpd -p sn -r /dev/$device | cut -d $'\003' -f2 | tr -cd '\060-\132' | cut -c-24)"
+                    verbose "blue" "Found serial $serial_sg_vpd via sg_vpd"
+                    if [ "$serial" != "none" -a "$serial" == "$serial_sg_vpd" ]; then
+                        verbose "blue" "[ $serial == $serial_sg_vpd ]"
+                        found="1"
+                        export dev_$serial="/dev/$device"
+                        break
+                    elif [ "$serial" != "none" -a "$serial" != "$serial_sg_vpd" ]; then
+                        verbose "blue" "[ $serial != $serial_sg_vpd ]"
+                    elif [ "$serial" == "none" -a -n "$serial_sg_vpd" ]; then
+                        export serial_sg_vpd_$device="$serial_sg_vpd"
+                    fi
+                else
+                    verbose "blue" "Failed $serial via sg_vpd"
+                fi
+                if (mdadm -D /dev/$device 1>&3 2>&4); then
+                    serial_mdadm=$(mdadm -D /dev/$device | grep UUID | tr -d "UUID| |:")
+                    verbose "blue" "Found UUID $serial_mdadm via mdadm"
+                    if [ "$serial" != "none" -a "$serial" == "$serial_mdadm" ]; then
+                        verbose "blue" "[ $serial == $serial_mdadm ]"
+                        found="1"
+                        export dev_$serial="/dev/$device"
+                        break
+                    elif [ "$serial" != "none" -a "$serial" != "$serial_mdadm" ]; then
+                        verbose "blue" "[ $serial != $serial_mdadm ]"
+                    elif [ "$serial" == "none" -a -n "$serial_mdadm" ]; then
+                        export serial_mdadm_$device="$serial_mdadm"
+                    fi
+                else
+                    verbose "blue" "Failed $serial via mdadm"
+                fi
             fi
         done
+        if [ "$found" == "1" ]; then
+            cecho "-light_blue" "$device..."
+            cecho "green" "OK"
+        else
+            if [ "$serials" != "none" ]; then
+                cecho "red" "NOT_FOUND"
+            fi
+        fi
+    done
+}
+
+function init_array {
+    verbose "blue" "function init_array"
+    cecho "-light_blue" "Starting mdadm..."
+
+    run_command "mdadm --assemble --scan" "" "Failed to assemble the array" "Array assembled" "do_not_fail_on_condition" ""
+
+    cecho "green" "OK"
+}
+
+function init_net {
+    verbose "blue" "function init_net [interfaces: $(ls /sys/class/net), wired_devices_mask: $wired_devices_mask, wireless_devices_mask: $wireless_devices_mask]"
+    cecho "-light_blue" "Configuring network interfaces..."
+
+    while [ -n "$wired_devices_mask" ] && [ -z $(ls /sys/class/net | grep $wired_devices_mask) ]; do
+        cecho "blue" "Waiting for ${wired_devices_mask}x device(s) to become active"
+        sleep 1
+    done
+    local wired_devices=$(ls /sys/class/net | grep ${wired_devices_mask:-empty})
+    
+    while [ -n "$wireless_devices_mask" ] && [ -z $(ls /sys/class/net | grep $wireless_devices_mask) ]; do
+        cecho "blue" "Waiting for ${wireless_devices_mask}x device(s) to become active"
+        sleep 1
+    done
+    local wireless_devices=$(ls /sys/class/net | grep ${wireless_devices_mask:-empty})
+    
+    check_if_argument_empty "wired_devices wireless_devices"
+    
+    local wired_device
+    for wired_device in $wired_devices; do
+        cecho "-light_blue" "$wired_device..."
+        if [ $(ps aux | grep udhcpc | wc -l) -lt "2" ]; then
+            local resource="udhcpc"
+        else
+            local resource=""           
+        fi
+        run_command "udhcpc -i $wired_device 1>&3 2>&4 &" "[ -n "$wired_device" ]" "" "Starting udhcpc DHCP client on $wired_device"  "fail_on_condition" "${resource:-}"
+    done
+        
+    local wireless_device
+    for wireless_device in $wireless_devices; do
+        cecho "-light_blue" "$wireless_device..."
+        if [ -n "$wireless_device" ] && [ -f /etc/wpa_supplicant/wpa_supplicant.conf ]; then
+            if [ $(ps aux | grep wpa_supplicant | wc -l) -lt "2" ]; then
+                local resource="wpa_supplicant"
+            else
+                local resource=""
+            fi
+            check_for_program "wpa_supplicant --help"
+            run_command "wpa_supplicant -Dnl80211 -i$wireless_device -c/etc/wpa_supplicant/wpa_supplicant.conf &" "" "" "Starting wpa_supplicant" "fail_on_condition" "${resource:-}"
+            if [ $(ps aux | grep udhcpc | wc -l) -lt "2" ]; then
+                local resource="udhcpc"
+            else
+                local resource=""
+            fi
+            run_command "udhcpc -i $wireless_device 1>&3 2>&4 &" "" "" "Starting udhcpc DHCP client on $wireless_device" " 0" "$resource"
+        else
+            verbose "yellow" "device [$wireless_device] does not exist or configuration file missing, could not start wpa_supplicant"
+        fi
+    done
+    cecho "green" "OK"
 }
 
 function install_busybox {
-        verbose "function install_busybox"
-    	
-     	run_command "[ -x /bin/busybox ]" "" "Checking for /bin/busybox" "0" ""
-     	run_command "[ -d /sbin ]" ""  "Checking for /sbin directory" "0" ""
-        run_command "/bin/busybox --install" "" "Installing busybox..." "0" ""
-    }
-    
-    function install_gentoo {
-        local destination="${1:-}"
-        
-        verbose "function install_gentoo [$(echo destination: $destination)]"
-        
-        check_if_empty "$destination"
-        
-        #wget -P "$destination" http://distfiles.gentoo.org/releases/amd64/autobuilds/$(curl http://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3.txt | grep stage3-amd64-2017 | cut -d " " -f1)
-        wget -P "$destination" http://10.0.0.1/stage3-amd64-20170406.tar.bz2
-        set +f
-        tar -xpf "$destination"/stage3-amd64-*.tar.bz2 -C "$destination"
-        rm "$destination"/stage3-amd64-*.tar.bz2
-        #wget -P "$destination" http://distfiles.gentoo.org/snapshots/portage-latest.tar.bz2
-        wget -P "$destination" http://10.0.0.1/portage-latest.tar.bz2
-        tar -xf "$destination"/portage-latest.tar.bz2 -C "$destination"/usr
-        rm "$destination"/portage-latest.tar.bz2
-        set -f
-                
-        sed -i "s/*//" "$destination"/etc/shadow
-        
-        cp /etc/resolv.conf "$destination"/etc/
-        ln -sv /proc/self/fd /dev/fd
-                
-        mount -o bind /dev $destination/dev
-        check_status "$destination/dev"
+    local destination="${1:-}"
+    verbose "blue" "function install_busybox"
 
-        mount -t proc none $destination/proc
-        check_status "$destination/proc"
+    cecho "-light_blue" "Installing busybox..."
 
-        echo -e "MAKEOPTS=\"-j24 -l24\"\nEMERGE_DEFAULT_OPTS=\"--jobs=24 --load-average=24.0 --with-bdeps y\"" >> $destination/etc/portage/make.conf 
-        
-        # CHECK FOR INTERNET CONNECTION
-        # basic
-        #chroot "$destination" su -l -c "emerge eix ufed; eix-update"
-        
-        # virtualization
-        #chroot "$destination" su -l -c "emerge qemu"
-
-        # wireless
-        #chroot "$destination" su -l -c "emerge wpa_supplicant; rc-update add wpa_supplicant default"
-        #exec sh
-        #chroot "$destination" su -l -c "emerge wpa_supplicant"
-        
-        #cp /etc/wpa_supplicant/wpa_supplicant.conf "$destination"/etc/wpa_supplicant/
-        
-    }
-    
-function mount_dev {
-	local serials="${1:-}"
-	local size="${2:-}"
-
-	verbose "function mount_dev [serials: $serials, size: $size]" "blue"
-
-	for serial in $serials; do
-	cecho "Mounting $(eval echo $serial...)" "-lb"
-	if [ -n "$size" ]; then
-        local mount_point="$serial"
-        run_command "mkdir $mount_point" "[ ! -d $mount_point ]" "$mount_point does not exist, creating" "permissive" "$mount_point"
-        run_command "mount -o size=$size -t tmpfs tmpfs $mount_point" "" "Creating $size RAMdisk at $mount_point" "0" "$mount_point"
-	elif [ "$serial" == "$serial_root" ]; then
-        verbose "Mounting mount -o bind /mnt/$serial_keys/$serial_root/ /usr/src/$(readlink /usr/src/linux)-laptop/initramfs/$serial_root"
-        if [ ! -d /usr/src/$(readlink /usr/src/linux)-laptop/initramfs/"$serial_root" ]; then
-            mkdir /usr/src/$(readlink /usr/src/linux)-laptop/initramfs/opt/keys/"$serial_root"
-        fi
-        mount -o bind /mnt/"$serial_keys"/"$serial_root" /usr/src/$(readlink /usr/src/linux)-laptop/initramfs/opt/keys/"$serial_root"
-        if [ "$?" == "0" ]; then
-            resources_to_clean=$(echo /usr/src/$(readlink /usr/src/linux)-laptop/initramfs/opt/keys/"$serial_root" ${resources_to_clean:-})
-        fi
-	elif [ -b /dev/mapper/"$serial" ]; then
-        run_command "mkdir /mnt/$serial" "[ ! -d /mnt/$serial ]" "/mnt/$serial does not exist, creating..." "permissive" "/mnt/$serial"
-        verbose "Mounting /dev/mapper/$serial at /mnt/$serial" "blue"        
-        if (mount /dev/mapper/$serial /mnt/$serial &> /dev/null); then
-            if [ "$serial" != "laptop-root" ]; then
-                check_status "/mnt/$serial"
-            fi
-        else
-            format_dev "$serial"
-            mount_dev "$serial"
-		fi
-	elif eval [ "$serial" == "\${dev_$serial_boot}1" ]; then
-        verbose "Mounting /dev/mapper/$serial at /boot" "blue"
-        if (eval mount /dev/mapper/$serial /boot &> /dev/null); then
-            check_status "/boot"
-        else
-            format_dev "$serial"
-            mount_dev "$serial"
-		fi
+    if [ -n "$destination" ]; then
+        create_dirs "$destination" "bin dev etc init.d proc sbin sys"
+        run_command "cp /bin/busybox $destination/bin/busybox" "[ -x /bin/busybox ]" "Failed to copy /bin/busybox, doesn't exist or not executable!" "Copying /bin/busybox to $destination/bin" "fail_on_condition" ""
+        run_command "chroot $destination /bin/busybox --install" "[ -x /bin/busybox ]" "" "Installing busybox" "fail_on_condition" ""
+        echo -e \#!/bin/busybox sh\nexec sh > $destination/init.d/rcS
+        run_command "chmod +x $destination/init.d/rcS" "[ ! -x $destination/init ]" "Failed to make $destination/init.d/rcS executable, already is!" "Making $destination/init.d/rcS executable..." "fail_on_condition" ""  
+        echo "dev     /dev    devtmpfs    defaults    0 0" >> $destination/etc/fstab
+        echo "proc    /proc   proc        defaults    0 0" >> $destination/etc/fstab
+        echo "sys     /sys    sysfs       defaults    0 0" >> $destination/etc/fstab
     else
-        cecho "$serial not found, exiting!" "red"
+        run_command "/bin/busybox --install" "[ -x /bin/busybox ]" "" "Installing busybox" "fail_on_condition" ""
     fi
-    cecho "OK" "green"
+
+    cecho "green" "OK"
+}
+    
+function install_gentoo {
+    check_number_of_arguments "install_gentoo" "$#" "1"
+    local destination="${1:-}"
+    #local files_to_copy="${2:-}"
+    #local packages_to_emerge="${3:-}"
+    verbose "blue" "function install_gentoo [destination: $destination]"
+    check_if_argument_empty "$destination"
+    
+    local cores_num=$(cat /proc/cpuinfo | grep processor | wc -l)
+    
+    until (nc -z google.com 80); do
+        cecho "yellow" "Waiting for the network to become available"
+        sleep 1
     done
+
+    if ! wget -P "$destination" "$http_server"/stage3-amd64-20170907.tar.bz2; then
+        wget -P "$destination" http://distfiles.gentoo.org/releases/amd64/autobuilds/$(curl http://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3.txt | grep stage3-amd64-$(date +%Y) | cut -d " " -f1)
+    fi
+    set +f
+    if [ -x /bin/tar -a -x /usr/bin/pbzip2 ]; then
+        cecho "red" "using parallel"
+        time /bin/tar -xpf "$destination"/stage3-amd64-*.tar.* -I pbzip2 -C "$destination" # will get depracated, stupid idea # check for verbose
+    else
+        EXTRACT_UNSAFE_SYMLINKS=1 time tar -xpf "$destination"/stage3-amd64-*.tar.* -C "$destination" # will get depracated, stupid idea # check for verbose
+    fi
+    rm "$destination"/stage3-amd64-*.tar.*
+    if ! wget -P "$destination" "$http_server"/portage-latest.tar.bz2; then
+       wget -P "$destination" http://distfiles.gentoo.org/snapshots/portage-latest.tar.bz2
+    fi
+    if [ -x /bin/tar -a -x /usr/bin/pbzip2 ]; then
+        cecho "red" "using parallel"
+        /bin/tar -xf "$destination"/portage-latest.tar.bz2 -I pbzip2 -C "$destination"/usr # check for verbose # uncomment
+    else
+        tar -xf "$destination"/portage-latest.tar.bz2 -C "$destination"/usr # check for verbose # uncomment
+    fi
+    rm "$destination"/portage-latest.tar.bz2
+    set -f
+
+    sed -i  "s/*//" "$destination"/etc/shadow
+
+    cp /etc/resolv.conf "$destination"/etc/
+    ln -sv /proc/self/fd /dev/fd
+
+    run_command "mount -o bind /dev $destination/dev" "" "aaab" "aaa" "do_not_fail_on_condition" "$destination/dev"
+
+    mount -t proc none $destination/proc
+    check_status "" "$destination/proc"
+    mount -o bind /dev/shm $destination/dev/shm
+    check_status "" "$destination/dev/shm"
+
+    echo -e "MAKEOPTS=\"-j$cores_num -l$cores_num\"\nEMERGE_DEFAULT_OPTS=\"--jobs=$cores_num --load-average=$cores_num --with-bdeps y\"" >> $destination/etc/portage/make.conf 
+
+    if (echo ${installation:-} | grep basic); then
+        packages="eix \
+                  mdadm \
+                  ufed"
+        post_commands="eix-update;"
+    fi
+
+    if (echo $installation | grep cu_boot); then
+        packages="${packages:-} \
+                  cryptsetup \
+                  dev-vcs/git \
+                  lvm2"
+    fi
+
+    if (echo $installation | grep graphical); then
+        pre_commands="\
+            eselect profile set 12; \
+            sed -i s:bindist:bindist\ -abi_x86_32: /etc/portage/make.conf; \
+            sed -i s:mmx:mmx\ mmxext: /etc/portage/make.conf; \
+            echo VIDEO_CARDS=nvidia >> /etc/portage/make.conf; \
+            echo L10N=\"pl\" >> /etc/portage/make.conf; \
+            mkdir -p /etc/portage/package.mask; \
+            echo \>x11-drivers/nvidia-drivers-340.104 >> /etc/portage/package.mask/nvidia-drivers; \
+            emerge gentoolkit gentoo-sources; \
+            zcat /proc/config.gz > /usr/src/linux-\$(uname -r | cut -d- -f1)-gentoo/.config; \
+            make -C /usr/src/linux-\$(uname -r | cut -d- -f1)-gentoo -j$(cat /proc/cpuinfo | grep processor | wc -l) modules; \
+            make -C /usr/src/linux-\$(equery which gentoo-sources | cut -d- -f5 | rev | cut -d. -f2- | rev)-gentoo -j$(cat /proc/cpuinfo | grep processor | wc -l) modules_install; \
+            emerge -uNDv world;"
+        packages="$packages \
+            xorg-x11 \
+            plasma-desktop \
+            sddm"
+        post_commands="$post_commands \
+            sed -i s:xdm:sddm: /etc/conf.d/xdm; \
+            rc-update add xdm default; \
+            depmod -a; \
+            modprobe nvidia; \
+            nvidia-xconfig; \
+            useradd -p \"\" user; \
+            gpasswd -a user wheel; \
+            service xdm restart;"
+    fi
+
+    if (echo $installation | grep plasma_programs); then
+        pre_commands="$pre_commands \
+            mount -o remount,size=20G; \
+            echo \>=dev-lang/python-2.7.12:2.7 sqlite > /etc/portage/package.use/firefox;"
+
+        packages="\
+            firefox \
+            kde-apps/dolphin \
+            kmix \
+            systemsettings \
+            yakuake"
+    fi
+    
+    # plasma-meta
+    if (echo $installation | grep virtualization); then
+        packages="$packages \
+            qemu"
+    fi
+
+            #app-emulation/docker \
+            #"
+#        post_commands="$post_commands \
+#            rc-update add docker default;"
+
+
+    if (echo $installation | grep wireless); then
+        packages="$packages \
+            wpa_supplicant"
+        post_commands="$post_commands \
+        rc-update add wpa_supplicant default;"
+    fi
+    
+    if [ -n "${installation:-}" ]; then
+        chroot "$destination" su -l -c "env-update; source /etc/profile; ${pre_commands:-} emerge $packages; $post_commands"
+    fi
+    
+    cecho "green" "OK"
 }
 
-    function mount_filesystems {
-        verbose "function mount_filesystems"
-        
-        run_command "[ -f /etc/mtab ]" "" "Checking for /etc/mtab" "0" ""
-        run_command "mount -t devtmpfs none /dev" "[ -d /dev ]" "Mounting /dev" "0" "/dev"
-        run_command "mount -t proc none /proc" "[ -d /proc ]" "Mounting /proc" "0" "/proc"
-        run_command "mount -t sysfs none /sys" "[ -d /sys ]" "Mounting /sys" "0" "/sys"
-    }
+function install_os {
+    destination="${1:-}"
+    check_number_of_arguments "install_os" "$#" "1"
+    check_if_argument_empty "$destination"
     
-    function open_devices {
-        verbose "function open_devices" "blue"
-        cecho "opening devices..." "-lb"
-        
+    cecho "default" "Would you like to install the (b)usybox system, (g)entoo from stage3?"
+    local answer=""
+    read answer
+    while [ "$answer" != "b" -a "$answer" != "g" ]; do
+        cecho "yellow" "Please enter a correct answer [(b)usybox/(g)entoo]"
+        read answer
+    done
+    if [ "$answer" == "b" ]; then
+        install_busybox "$destination"
+    elif [ "$answer" == "g" ]; then
+        install_gentoo "$destination"
+    else
+        cecho "red" "Something went wrong[answer ~= b|g], exiting!"
+        exit_error
+    fi
+}
+
+function mount_filesystems {
+    verbose="yes"
+    verbose "blue" "function mount_filesystems"
+    
+    cecho "-light_blue" "Mounting /dev, /proc, /sys filesystems..."
+
+    if [ -f /etc/mtab ]; then
+        run_command "mount -t devtmpfs none /dev" "[ -d /dev ]" "" "Mounting /dev" "fail_on_condition" "/dev"
+        run_command "mkdir -p /dev/shm" "[ ! -d /dev/shm ]" "" "Creating /dev/shm directory" "fail_on_condition" "/dev/shm"
+        run_command "mkdir -p /run/shm" "[ ! -d /run/shm ]" "" "Creating /run/shm directory" "fail_on_condition" "/run/shm"
+        run_command "mount -o mode=1777 -t tmpfs shm /dev/shm" "[ -d /dev/shm ]" "" "Mounting /dev/shm" "fail_on_condition" "/dev/shm"
+        run_command "mkdir /dev/pts" "[ ! -d /dev/pts ]" "" "" "fail_on_condition" "/dev/pts"
+        run_command "mount -o gid=5 -t devpts devpts /dev/pts" "" "" "" "fail_on_condition" "/dev/pts"
+        run_command "mount -t proc none /proc" "[ -d /proc ]" "" "Mounting /proc" "fail_on_condition" "/proc"
+        run_command "mount -t sysfs none /sys" "[ -d /sys ]" "" "Mounting /sys" "fail_on_condition" "/sys"
+    else
+        cecho "red" "/etc/mtab not found, exiting!"
+        exit_error
+    fi
+
+        if (cat /proc/cmdline | grep verbose); then
+        verbose="yes"
+    else
+        verbose="no"
+    fi
+
+    if (cat /proc/cmdline |  grep debug); then
+        debug="yes"
+    else
+        debug="no"
+    fi
+
+
+    cecho "green" "OK"
+}
+
+# checked
+function list_keys {
+    if [ "$#" == "1" ]; then
+        local directory="${1:-}"
+        check_if_argument_empty "$directory"
+        if [ -n "$(ls -A $directory/ | sed 's/lost+found//')" ]; then
+            cecho "light_blue" "Existing keys:"
+            local key
+            for key in $(ls -1 $directory | sed 's/lost+found//'); do
+                cecho "yellow" "$key"
+                cecho "yellow" "$(ls -1 $directory/$key)\n"
+            done
+        else
+            cecho "yellow" "No keys found in $directory directory."
+        fi
+    else
+        cecho "red" "Please set the \"directory\" arguments for \"list_keys\" function properly and try again, exiting!"
+        exit_error
+    fi
+}
+
+function mount_home {
+    local vg_lv="${1:-}"
+    verbose "blue" "function mount_home [VG/LV: $vg_lv]"
+
+    check_if_argument_empty "$vg_lv"
+
+    cecho "-light_blue" "Checking the home filesystem integrity..."
+    #if (fsck.ext4 /dev/"$vg_lv"); then
+    #    cecho "green" "OK"
+    #else
+    #    cecho "default" "Filesystem integrity check has failed, would you like to recreate from backup?[no/yes]"
+#        get_answer  # check
+#        restore_root "${vg_lv}_backup" "$vg_lv" "yes"
+#        mount_root "$@"
+    #fi
+    if (mountpoint /home 1>&3 2>&4); then
+        verbose "blue" "/home already mounted, skipping"
+    else
+	run_command "DM_DISABLE_UDEV=1 lvm lvchange -ay $vg_lv" "[ ! -b /dev/$vg_lv ]" "" "Activating $vg_lv" "do_not_fail_on_condition" ""
+	mount /dev/"$vg_lv" /home
+    fi
+}
+
+function mount_root {
+    local lv="${1:-}"
+    local mount_dir="$(echo $lv | sed s:/:-:)"
+    verbose "blue" "function mount_root [LV: $lv, mount_dir: $mount_dir]"
+
+    check_if_argument_empty "$lv" "$mount_dir"
+
+    if (mountpoint /mnt/"$mount_dir" 1>&3 2>&4); then
+        cecho "-yellow" "/mnt/$mount_dir already mounted, skipping..."
+    else
+        mount_dev /dev/mapper/"$mount_dir"
+        if [ ! -f "/mnt/$mount_dir/sbin/init" ]; then
+            cecho "default" "Operating System(OS) not found."
+            install_os "/mnt/$mount_dir"
+        fi
+        if [ -f "/mnt/$mount_dir/back_up" ]; then
+            back_up_root
+        fi
+        if [ -f "/mnt/$mount_dir/restore" ]; then
+            cecho "default" "/restore file exists, would you like to restore from backup?[no/yes]"
+            get_answer
+            if [ "$answer" == "yes" ]; then
+                restore_root
+            else
+                cecho "yellow" "Deleting /restore and skipping."
+                run_command "/mnt/laptop-root/restore" "[ -f /mnt/laptop-root/restore ]" "Failed to delete /mnt/laptop-root/restore" "Deleting /mnt/laptop-root/restore" "fail_on_condition" ""
+            fi
+       fi
+    fi
+}
+
+function open_devices {
+    verbose "blue" "function open_devices"
+
+    if [ -z "$(ls $keys_dir)" ]; then
+        cecho "default" "No keys found in initramfs, would you like to generate some? Otherwise the storage options will be limited to volatile Random Access Memory(RAM) only.[no/yes]"
+        get_answer
+        if [ "$answer" == "no" ]; then
+            ram_only=1
+        elif [ "$answer" == "yes" ]; then
+            while get_dev_name "$serial_keys" 1>&3 2>&4; [ ! -b "$(eval echo \${dev_$serial_keys:-})" ]; do
+                cecho "yellow" "Please insert the device with serial \"$serial_keys\" to continue..."
+                sleep 3
+            done
+            open_luks "$serial_keys"
+            mount_dev "/dev/mapper/$serial_keys"
+            gen_keys "$serial_keys" ""
+            ./cu_boot.sh
+        fi
+    else
         local serial
-		for serial in $(ls /opt/keys); do
-			get_dev_name "$serial"
-			open_luks "$serial" "key"
-			eval "cryptsetup luksOpen --header /opt/keys/"$serial"/"$serial".header --key-file /dev/mapper/key_$serial /dev/\$dev_$serial $serial"
-			#	verbose "lvm not found, initializing httpd"
-			#	export serial_id
-			#	httpd -h /var/www
-			#	sleep 180;
-			#	while (pgrep -f "busybox dd"); do sleep 1; done
-			#	killall httpd
-			#	if [ -f /var/www/dd.log ]; then lvm pvcreate /dev/mapper/$serial_id; fi
-			#fi
-		done
-		
-		cecho "OK" "green"
-	}
-	
-function open_luks {	
-	local arguments="${1:-}"
-	local type="$2"
-	verbose "function open_luks [arguments: $arguments, type: $type]" "blue"
-    check_if_empty "$arguments" "$type"    
-    check_for_program "cryptsetup --version"
-    
-    for argument in $arguments; do
-    cecho "Openning $(eval echo $argument...)" "-lb"
-    if [ "$type" == "device" ]; then
-        if eval [ -b /dev/"$argument" ]; then
-            verbose "Attempting to open device /dev/$argument as /dev/mapper/$argument" "-b"
-            eval cryptsetup luksOpen /dev/"$argument" "$argument"
-            check_status $(eval echo "$argument")
-        else
-            verbose "/dev/$argument does not exist, exiting!" "red"
-            exit 1
-        fi
-    elif [ "$type" == "serial" ]; then
-        get_dev_name "$argument"
-        run_command "[ -b /dev/\$dev_$argument ]" "" "Checking if $( eval echo \$dev_$argument) exists" "0" ""
-        if (eval cryptsetup isLuks /dev/\$dev_$argument); then
-            run_command "cryptsetup luksOpen /dev/\$dev_$argument $argument" "" "Attempting to open /dev/\$dev_$argument as /dev/mapper/$argument" "0" "/dev/mapper/$argument"
-        else
-            if [ "$hardened" == "yes" ]; then
-                erase_dev "$argument"
+        for serial in $(ls $keys_dir); do
+            get_dev_name "$serial"
+            if [ -b "$(eval echo \${dev_$serial:-})" ]; then
+                cecho "-light_blue" "Attempting to open $(eval echo \${dev_$serial:-}) with serial $serial..."
+                open_luks "$keys_dir/$serial/$serial"
+                run_command "cryptsetup luksOpen --header $keys_dir/$serial/$serial.header --key-file /dev/mapper/key_$serial \$dev_$serial $serial" "[ -b \$dev_$serial ]" "Failed to open \$dev_$serial $serial using $keys_dir/$serial" "Openning device \$dev_$serial $serial using $keys_dir/$serial" "fail_on_condition" ""
+                cecho "green" "OK"
+            else
+                cecho "yellow" "Device with serial $serial doesn't exist, skipping."
             fi
-            format_dev "$argument" "luks"
-            open_luks "$argument" "serial"
-            if [ "$hardened" == "yes" ]; then
-                erase_dev "$argument" "luks"
-            fi
-        fi
-    elif [ "$type" == "key" ]; then
-        verbose "Attempting to open key $argument as /dev/mapper/key_$argument" "-b"
-        if [ -d /opt/keys/"$argument" ]; then
-            cryptsetup luksOpen --key-file=/opt/keys/"$argument"/"$argument".key /opt/keys/"$argument"/"$argument" "key_$argument"
-            check_status "key_$argument"
-        elif [ -n "$serial_keys" ] && [ -d /mnt/"$serial_keys"/"$argument" ]; then
-            cryptsetup luksOpen --key-file=/mnt/"$serial_keys"/"$argument"/"$argument".key /mnt/"$serial_keys"/"$argument"/"$argument" "key_$argument"
-            check_status " $argument"
-        else
-            cecho "key $argument does not exist, exiting!" "red"
-            exit 1
-        fi
+        done
     fi
-    cecho "OK" "green"
+}
+
+# checked
+function mount_dev {
+    local devices_mountpoints="$@"
+    verbose "blue" "function mount_dev [devices_mountpoints: $devices_mountpoints]"
+    check_if_argument_empty "$devices_mountpoints"
+
+    for device_mountpoint in $devices_mountpoints; do
+        if [ -d "/mnt/$serial_keys/$device_mountpoint" ]; then
+            local key="$device_mountpoint"
+            cecho "-light_blue" "Mounting $key key at /usr/src/linux-$arch/initramfs/$keys_dir/$key..."
+            run_command "mkdir /usr/src/linux-$arch/initramfs/$keys_dir/$key" "[ ! -d /usr/src/linux-$arch/initramfs/$keys_dir/$key ]" "Failed to create /usr/src/linux-$arch/initramfs/$keys_dir/$key directory, exiting!" "Creating /usr/src/linux-$arch/initramfs/$keys_dir/$key directory" "fail_on_condition" "/usr/src/linux-$arch/initramfs/$keys_dir/$key"
+            run_command "mount -o bind /mnt/$serial_keys/$key /usr/src/linux-$arch/initramfs/$keys_dir/$key" "[ -d /usr/src/linux-$arch/initramfs/$keys_dir/$key ]" "Failed to mount /mnt/$serial_keys/$key at /usr/src/linux-$arch/initramfs/$keys_dir/$key directory, exiting!" "Mounting /mnt/$serial_keys/$key at /usr/src/linux-$arch/initramfs/$keys_dir/$key" "fail_on_condition" "/usr/src/linux-$arch/initramfs/$keys_dir/$key"
+        elif eval [ -b "$device_mountpoint" ]; then
+            local device="$device_mountpoint"
+            if [ "$device" == "/dev/mapper/$(eval basename \${dev_$serial_boot:-}1)" ]; then
+                mount_point="/boot"
+            else
+                eval local mount_point="/mnt/${device##*/}"
+            fi
+            cecho "-light_blue" "Mounting $device at $mount_point..."
+            run_command "mkdir $mount_point" "[ ! -d $mount_point ]" "Failed to create $mount_point directory, exiting!" "Creating $mount_point directory" "do_not_fail_on_condition" "$mount_point"
+            if (eval mount $device $mount_point 1>&3 2>&4); then
+                if [ "${device##*/}" != "laptop-root" ]; then
+                    check_status "" "$mount_point"
+                fi
+            else
+                cecho "red" "FAILED"
+                cecho "yellow" "Failed, device $device not formatted!"
+                format_dev "$device" ""
+                cecho "green" "OK"
+                mount_dev "$device" ""
+            fi
+        else
+            cecho "red" "$device_mountpoint not found, exiting!"
+            exit_error
+        fi
+        cecho "green" "OK"
+        done
+}
+
+function mount_ramdisk {
+    if [ "$#" == "2" ]; then
+        local mountpoint="$1"
+        local size="$2"
+        verbose "blue" "function mount_ramdisk [moutpoint: $mountpoint, size: $size]"
+        check_if_argument_empty "$mountpoint" "$size"
+    
+        cecho "-light_blue" "Mounting $size RAMdisk at $mountpoint..."
+        if [ ! -d $mountpoint ]; then
+            run_command "mkdir $mountpoint" "[ ! -d $mountpoint ]" "Failed to create $mountpoint directory, exiting!" "Creating $mountpoint directory" "fail_on_condition" "$mountpoint"
+        fi
+        if [ "$size" == "ramfs" ]; then
+            run_command "mount -t ramfs ramfs $mountpoint" "[ -d $mountpoint ]" "Failed to mount $size RAMdisk at $mountpoint, exiting!" "Mounting $size RAMdisk at $mountpoint" "fail_on_condition" "$mountpoint"
+        else
+            run_command "mount -o size=$size -t tmpfs tmpfs $mountpoint" "[ -d $mountpoint ]" "Failed to mount $size RAMdisk at $mountpoint, exiting!" "Mounting $size RAMdisk at $mountpoint" "fail_on_condition" "$mountpoint"
+        fi
+        cecho "green" "OK"
+    else
+        cecho "red" "[ $# != 2 ]\nPlease set the arguments for \"mount_ramdisk\" function properly and try again, exiting!"
+    fi
+}
+
+# checked
+function open_luks {
+    local serials_devices_keys="$@"
+    verbose "blue" "function open_luks [serials_devices_keys: $serials_devices_keys]"
+    check_if_argument_empty "$serials_devices_keys"
+
+    check_for_program "cryptsetup --version"
+
+    local serial_device_key
+    for serial_device_key in $serials_devices_keys; do
+        if [ "${serial_device_key:0:5}" == /dev/ ]; then
+            local device="$serial_device_key"
+            local name=$(basename $device)
+        elif [ -f "$serial_device_key" ]; then
+            local device="$serial_device_key"
+            local name=key_$(basename $device)
+            local cryptsetup_opts="--key-file=${device}.key"
+        elif [ -n "$serial_device_key" ]; then # improvement, -b on dev_$serial should be more appropriate
+            local serial="$serial_device_key"
+            local name="$serial"
+            check_if_device_with_serial_exists "$serial"
+            local device=$(eval echo \$dev_$serial)
+        else
+            cecho "red" "[ $serial_device_key:0:5 != /dev/ -a !-f $serial_device_key -a !=n $serial_device_key ]\nPlease specify the arguments for \"open_luks\" function properly and try again, exiting!"
+            exit_error
+        fi
+
+        if (cryptsetup isLuks $device); then
+            run_command "cryptsetup luksOpen ${cryptsetup_opts:-} $device $name" "[ ! -b /dev/mapper/$name ]" "Could not open $device, exiting!" "" "fail_on_condition" "/dev/mapper/$name"
+        else
+            if [ "$hardened" == "yes" ]; then
+                erase_dev "$device"
+            fi
+            format_dev "$device" "luks"
+            open_luks "$serial_device_key"
+            if [ "$hardened" == "yes" ]; then
+                erase_dev "/dev/mapper/$name"
+            fi
+        fi
     done
 }
 
-function run_command {    
-    local command="${1:-}"
-    local condition="${2:-}"
-    local message="${3:-}"
-    local permissible="${4:-}"
-    local resource="${5:-}"
+function prep_kernel_sources {
+    local arch="${1:-}"
+    verbose "blue" "function prep_kernel_sources [arch:$arch]"
+    check_if_argument_empty "$arch"
     
-    verbose "function run_command [command: $command, condiftion: $condition, message: $message, permissible: $permissible: $permissible, resource: $resource]" "blue"
-
-    check_if_empty "$command"
-    
-    if $condition; then
-        if [ -z "$message" ]; then
-            verbose "executing command [$command]..." "-b"
-        else
-            verbose "$message..." "-b"
+    if [ ! -L /usr/src/linux-"$arch" ]; then
+        verbose "blue" "/usr/src/linux/kernel-$arch symlink does not exist, checking for kernel sources"
+        if [ -d /usr/src/linux ]; then
+            verbose "blue" "kernel sources found in /usr/src/"
+        else 
+            cecho "red" "Missing /usr/src/linux symlink, please install kernel sources, exiting!"
+            exit_error
         fi
-        eval "$command"
-        check_status "$resource"
-    else
-        if [ "$permissible" == 0 ]; then
-            cecho "$condition not true, exiting!" "red"
-            exit 1
-        fi
+        local kernel_dir=$(readlink /usr/src/linux)
+        run_command "cp -Hr /usr/src/$kernel_dir /usr/src/$kernel_dir-$arch" "" "Copying kernel sources from /usr/src/$kernel_dir to /usr/src/$kernel_dir-$arch has failed!" "Kernel sources have been successfully copied from /usr/src/$kernel_dir to /usr/src/$kernel_dir-$arch" "do_not_fail_on_condition" ""
+        run_command "ln -s /usr/src/$kernel_dir-$arch /usr/src/linux-$arch" "" "Creating /usr/src/linux-$arch symlink has failed!" "/usr/src/linux-$arch symlink has been created successfully" "do_not_fail_on_condition" ""
     fi
+}
+
+# checked
+function run_command {
+    if [ "$#" == "6" ]; then
+        local command="${1:-}"
+        local condition="${2:-}"
+        local error_message="${3:-}"
+        local message="${4:-}"
+        local permissible="${5:-}"
+        local resource="${6:-}"
+    
+        verbose "blue" "function run_command [command: $command, condition: $condition, error_message: $error_message, message: $message, permissible: $permissible, resource: $resource]"
+
+        check_if_argument_empty "$command" "$permissible"
+
+        if eval $condition 1>&3 2>&4; then
+            if [ -z "$message" ]; then
+                verbose "blue" "Executing command [$command]..."
+            else
+                verbose "blue" "$message..."
+            fi
+            if [ -z "$error_message" ]; then
+                eval "$command"
+                check_status "$command" "$resource"
+            else
+                eval "$command"
+                check_status "$error_message" "$resource"
+            fi
+        else
+            if [ "$permissible" == "fail_on_condition" ]; then
+                cecho "red" "[ ! $condition ]\n Please set the \"condition\" argument for \"run-command\" function correctly and try again, exiting!"
+                exit_error
+            elif [ "$permissible" != "do_not_fail_on_condition" -a "$permissible" != "fail_on_condition" ]; then
+                cecho "red" "[ $permissible != do_not_fail_on_condition -a $permissible != fail_on_condition ]\n Please set the \"condition\" argument for \"run-command\" function correctly and try again, exiting!"
+                exit_error
+            fi
+        fi
+    else
+        cecho "red" "[ $# != 6 ]\nPlease set the arguments for \"run_command\" function properly and try again, exiting!"
+    fi
+}
+
+function format_root {
+    umount "/mnt/$root_dir"
+    run_command "mkfs.ext4 -F /dev/mapper/$root_dir" "[ -b /dev/mapper/$root_dir ]" "" "Formatting /dev/mapper/$root_dir" "fail_on_condition" ""
+    mount_dev "/dev/mapper/$root_dir"
 }
 
 function restore_root {
-    local dst="${2:-}"
-    local src="${1:-}"
-    local format="${3:-}"
-    
-    verbose "function restore_root [destination: $dst, format: $format, source: $src]" "blue"
-    
-    check_if_empty "$src" "$dst"
+    verbose "blue" "function restore_root"
+    local backup_dir="$(echo $backup_lv | sed s:/:-:)"
+    local root_dir="$(echo $root_lv | sed s:/:-:)"
+    check_lvm "no" "$backup_lv"
+
     check_for_program "lvm help"
     
-    run_command "lvm lvs $dst" "" "Checking if destination LVM volume $dst exists" "0" ""
-    run_command "lvm lvs $src" "" "Checking if source LVM volume $src exists" "0" ""
-    run_command "lvm lvchange -ay $dst &> /dev/null" "[ ! -b /dev/$dst ]" "Activating $dst" "permissive" ""
-    run_command "lvm lvchange -ay $src &> /dev/null" "[ ! -b /dev/$src ]" "Activating $src" "permissive" ""
-    if (mountpoint /mnt/$(echo $src | sed s:/:-:)); then
-        true
+    if ! mountpoint /mnt/"$backup_dir" 1>&3 2>&4; then
+        mount_dev "/dev/mapper/$backup_dir"
+    fi
+    if [ -z "$(ls /mnt/$backup_dir | sed 's/lost+found//')" ]; then
+        rm /mnt/"$root_dir"/restore
+        cecho "red" "No backup found, exiting!"
+        exit_error
+    fi
+    ls -1 /mnt/$backup_dir
+    if [ -x /bin/tar -a -x /usr/bin/pigz ]; then
+        cecho "red" "using parallel"
+        local unpack_command="time /bin/tar x -I pigz -C /mnt/$root_dir -f"
     else
-        mount_dev "$(echo $src | sed s:/:-:)"
+        local unpack_command="EXTRACT_UNSAFE_SYMLINKS=1 time tar x -C /mnt/$root_dir -j -f"
     fi
-    if (mountpoint /mnt/$(echo $dst | sed s:/:-:)); then
-        true
-    else
-        if [ "$format" == yes ]; then
-            run_command "mkfs.ext4 /dev/$dst" "[ -b /dev/$dst ]" "Formatting $dst" "0" ""
-        fi
-        mount_dev "$(echo $dst | sed s:/:-:)"
+    local archive
+    read archive
+    until format_root; cecho "-light_blue" "Unpacking OS from $archive to /mnt/${root_dir}..."; $unpack_command /mnt/$backup_dir/$archive; do
+#        ls -1 /mnt/$backup_dir | sed 's/.tar.bz2//'
+        ls -1lh /mnt/$backup_dir
+        read archive
+    done
+    if [ -f "/mnt/"$root_dir"/restore" ]; then
+        rm /mnt/"$root_dir"/restore
     fi
-    if [ -f "/mnt/$(echo $src | sed s:/:-:)/sbin/init" ]; then
-        run_command "rsync -aAXv --delete --exclude={/dev/*,/proc/*,/sys/*,/tmp/*,/run/*,/mnt/*,/media/*,/lost+found} /mnt/$(echo $src | sed s:/:-:) /mnt/$(echo $dst | sed s:/:-:)" "mountpoint /mnt/$(echo $src | sed s:/:-:) && mountpoint /mnt/$(echo $dst | sed s:/:-:)" "Copying the files from $src to $dst" "0" ""
-        umount /mnt/$(echo $src | sed s:/:-:)
-        run_command "lvm lvchange -an $src &> /dev/null" "[ -b /dev/src ]" "Deactivating $src" "0" ""
-    else
-        install_gentoo "/mnt/$(echo $dst | sed s:/:-:)"
-    fi
-}
-
-    function run_gentoo {
-        local destination="$1"
-
-        verbose "function run_gentoo [$(echo destination: $destination)]"
-                
-        wget -P /mnt/livedvd http://10.0.0.1/livedvd-amd64-multilib-20160704.iso
-        
-        mkdir /mnt/squashfs
-        mount /mnt/livedvd/livedvd-amd64-multilib-20160704.iso /mnt/squashfs
-        
-        mkdir /mnt/root
-        mount /mnt/squashfs/image.squashfs "$destination"
-        
-        #/home
-        #/tmp
-        
-        #sed -i "s/*//" "$destination"/etc/shadow
-        
-        #cp /etc/resolv.conf "$destination"/etc/
-        
-        #ln -sv /proc/self/fd /dev/fd
-                
-        #mount -o bind /dev /mnt/root/dev
-        #check_status "/mnt/root/dev"
-
-        #mount -t proc none /mnt/root/proc
-        #check_status "/mnt/root/proc"
-        
-        #chroot "$destination" su -l -c "emerge eix qemu ufed wpa_supplicant"
-        #cp /etc/wpa_supplicant/wpa_supplicant.conf "$destination"/etc/wpa_supplicant/
-    }
-
-	function set_variables {
-    	debug="no"
-	    verbose="yes"
-
-        verbose "function set_variables" "blue"
-    	cecho "Setting variables..." "-lb"
-    	
-    	hardened="no"
-    	late_net_iface="wlan0"
-        # 8GB tiny: 20CF302E23E4FCA0AC111014
-        # HP SSD: 161173400961
-        # Rachel doc: 1D225620
-        # Samsung SSD: S2R5NB0HC09645T 
-        serial_root="S2R5NB0HC09645T"
-        cecho "OK" "green"
-        echo aaa
-	}
-	
-function verbose {
-    local color=${2:-default}
-    local message="${1:-}"
-
-    if [ "$verbose" == "yes" ]; then
-        cecho "$message" "$color"
-    elif [ "$verbose" != "no" ] && [ "$verbose" != "yes" ]; then
-        cecho "verbose not set to [no/yes], exiting!" "red"
-        exit 1
-    fi
-}
     
+    for dir in dev proc run sys; do
+        if [ ! -d /mnt/$root_dir/$dir ]; then
+            mkdir /mnt/$root_dir/$dir
+        fi
+    done
+    
+    if [ ! -c "/mnt/$root_dir/dev/console" ]; then
+        mknod -m 600 /mnt/$root_dir/dev/console c 5 1
+    fi
+    
+    cecho "green" "OK"
+}
+
+#function run_gentoo {
+#    local destination="$1"
+
+#    verbose "blue" "function run_gentoo"
+
+#     run_command "wget -P /mnt/livedvd http://laptop/livedvd-amd64-multilib-20160704.iso" "" "Attempt to download livedvd iso has failed" "Downloading livedvd iso file..." "fail_on_condition" ""
+
+#     run_command "mkdir /mnt/iso" "" "Failed to create /mnt/iso directory" "Creating /mnt/iso directory..." "fail_on_condition" ""
+#     run_command "mount /mnt/livedvd/livedvd-amd64-multilib-20160704.iso /mnt/iso" "" "Failed to mount livedvd ISO at /mnt/iso" "Mounted livedvd ISO at /mnt/iso" "fail_on_condition" ""
+
+#     run_command "mkdir /mnt/squashfs" "" "Failed to create /mnt/squashfs" "Created /mnt/squashfs" "fail_on_condition" ""
+#     run_command "unsquashfs -f -d $destination /mnt/iso/image.squashfs" "" "Failed to mount squashfs image at /mnt/squashfs" "mounted squashfs image at /mnt/squashfs" "fail_on_condition" ""
+#     umount /mnt/iso
+#     rm /mnt/livedvd/livedvd-amd64-multilib-20160704.iso
+
+    #/home
+    #/tmp
+#     cecho "red" "deleting password"
+#     sed -i "s/*//" "$destination"/etc/shadow
+
+#     cecho "red" "Copying resolv.conf"
+#     cp /etc/resolv.conf "$destination"/etc/
+
+#     ln -sv /proc/self/fd /dev/fd
+#     cecho "red" "Mounting /dev  and /proc"
+#     run_command "mount -o rbind /dev $destination/dev" "" "" "" "do_not_fail_on_condition" "$destination/dev/pts $destination/dev/shm $destination/dev"
+#     run_command "mount -t proc none $destination/proc" "" "" "" "do_not_fail_on_condition" "$destination/proc"
+#     run_command "mount -o bind /sys $destination/sys" "" "" "" "do_not_fail_on_condition" "$destination/sys"
+    #mkdir $destination/dev/pts
+    #mount -o gid=5 -t devpts devpts $destination/dev/pts
+
+#     cecho "red" "chrooting"
+#     echo "MAKEOPTS=\"-j$(cat /proc/cpuinfo | grep processor | wc -l) -l$(cat /proc/cpuinfo | grep processor | wc -l)\"" >> $destination/etc/portage/make.conf
+#     echo "EMERGE_DEFAULT_OPTS=\"--jobs=$(cat /proc/cpuinfo | grep processor | wc -l) --load-average=$(cat /proc/cpuinfo | grep processor | wc -l) --with-bdeps y\"" >> $destination/etc/portage/make.conf
+# 
+#     chroot "$destination" su -l -c "\
+#     env-update && \
+#     source /etc/profile && \
+#     rm -rf /usr/portage && \
+#     wget -P /tmp http://192.168.1.72/portage-latest.tar.bz2 && \
+#     tar -xvpf /tmp/portage-latest.tar.bz2 -C /usr && \
+#     eselect profile set 12 && \
+#     USE=\"symlink\" emerge =gentoo-sources-\$(uname -r | cut -d- -f1) && \
+#     zcat /proc/config.gz > /usr/src/linux-\$(uname -r | cut -d- -f1)-gentoo/.config && \
+#     make -C /usr/src/linux-\$(uname -r | cut -d- -f1)-gentoo -j$(cat /proc/cpuinfo | grep processor | wc -l) modules && \
+#     make -C /usr/src/linux-\$(uname -r | cut -d- -f1)-gentoo -j$(cat /proc/cpuinfo | grep processor | wc -l) modules_install && \
+#     echo \>x11-drivers/nvidia-drivers-340.104 >> /etc/portage/package.mask/nvidia-drivers && \
+#     echo =media-libs/libepoxy-1.4.3 >> /etc/portage/package.mask/libepoxy && \
+#     sed -i s:VIDEO_CARDS=.*:VIDEO_CARDS=nvidia:g /etc/portage/make.conf && \
+#     sed -i s:bindist:bindist\ -abi_x86_32: /etc/portage/make.conf && \
+#     emerge -C xf86-video-virtualbox && \
+#     USE=\"-pax_kernel\" emerge nvidia-drivers && \
+#     depmod -a && \
+#     modprobe nvidia && \
+#     nvidia-xconfig"
+    
+    #chroot "$destination" su -l -c "emerge eix qemu ufed wpa_supplicant"
+    #cp /etc/wpa_supplicant/wpa_supplicant.conf "$destination"/etc/wpa_supplicant/
+    #chroot $destination /bin/bash
+# }
+
+function set_variables {
+    verbose="yes"
+    debug="yes"
+    
+    if (echo $@ | grep verbose); then
+        verbose="yes"
+    else
+        verbose="no"
+    fi
+
+    if (echo $@ | grep debug); then
+        debug="yes"
+    else
+        debug="no"
+    fi
+
+    verbose "blue" "function set_variables"
+    cecho "-light_blue" "Setting variables..."
+    backup_lv="laptop/backup" # Uses the remaining size of the device by default
+    backup_size="100%FREE"
+    root_lv="laptop/root"
+    root_size="10G" # in Gs
+    # # #
+    # Initrams configuration
+    # # #
+    hardened="no"
+    http_server="192.168.0.1"
+    initramfs_b43="yes"
+    initramfs_dell_t7500_audio="yes"
+    initramfs_dell_t7500_card_reader="yes"
+    initramfs_uvc_camera="yes"
+    initramfs_cryptsetup="yes"
+    initramfs_curl="yes"
+    initramfs_dns="yes"
+    initramfs_dm_raid="yes"
+    initramfs_docker="no"
+    initramfs_fuse="yes"
+    initramfs_kvm="yes"
+    initramfs_lsblk="yes"
+    initramfs_lspci="yes"
+    initramfs_lsusb="yes"
+    initramfs_lvm="yes"
+    initramfs_mdadm="yes"
+    initramfs_nv="yes"
+    initramfs_pbzip2="yes"
+    initramfs_pigz="yes"
+    initramfs_r8169="yes"
+    initramfs_raid1="yes"
+    initramfs_raid6="yes"
+    initramfs_rsync="yes"
+    initramfs_sas="yes"
+    initramfs_sdhci="no"
+    initramfs_squashfs="no"
+    initramfs_strace="no"
+    initramfs_usb_tethering="no"
+    initramfs_wireless="no"
+    keys_dir="opt/keys"
+
+    # # #
+    # Installation values:
+    # basic: cryptsetup eix syslog_ng ufed; eix-update; rc-update add syslog-ng default
+    # virtualization: emerge docker mdadm pip qemu
+    # wireless: emerge wpa_supplicant; cp ...wpa_supplicant.conf $destination
+    # # #
+#    installation="basic cu_boot virtualization wireless graphical plasma_programs" # check
+    installation="basic" # check
+    # # # # 
+    # Serials:
+    # 1TB: S2R8J9DC911615
+    # 8GB tiny: 20CF302E23E4FCA0AC111014 # remove?
+    # array_dell: 2fec9a94db6275a3ab7a767de94ead0b
+    # array_NAS: 9e8b7725cef416e14243b25641b2f617
+    # Doc: 797CE8BB
+    # HP SSD: 161173400961
+    # Rachel's doc: 1D225620 
+    # Samsung SSD: S2R5NB0HC09645T
+    # # #
+    serial_1TB="S2R8J9DC911615"
+    serial_array_Dell="e778723bfac446518fc157cd3cae10df"
+    serial_array_NAS="9e8b7725cef416e14243b25641b2f617"
+    serial_boot="200445277107FC827AE5"
+    serial_keys_backup="1D225620"
+    serial_keys="797CE8BB"
+    serial_laptop="BTPR142000RB080BGN"
+    serial_Samsung="S2R5NB0HC09645T"
+    serial_samsung="S2R5NB0HC09645T"
+#    mount -t sysfs sys /sys
+#    if [ "$(cat /sys/devices/virtual/dmi/id/product_serial)" == "JG9SVF1" ]; then
+        serial_root="BTPR142000RB080BGN"
+#        cecho "red" "Vostro"
+#    elif [ "$(cat /sys/devices/virtual/dmi/id/product_serial)" == "74GTTL1" ]; then
+#        serial_root="S2R5NB0HC09645T"
+#        cecho "red" "Dell"
+#    else
+#        exit_error
+#    fi
+#    umount /sys
+#    initramfs_keys="$serial_1TB $serial_array_NAS $serial_Samsung $serial_laptop" # automate?
+
+#    if [ "$(cat /sys/devices/virtual/dmi/id/product_name)" == "Vostro1510" ]; then
+#        serial_root="BTPR142000RB080BGN"
+#    elif [ "$(cat /sys/devices/virtual/dmi/id/product_name)" == "Precision WorkStation T7500  " ]; then
+#        serial_root="S2R5NB0HC09645T"
+#    else
+
+#        cecho "red" "Please add the serial number of the root device in the \"set_variables\" function and try again, exiting!"
+#        lsblk -o+serial
+#        exit_error
+#    fi
+
+    initramfs_keys="$serial_1TB $serial_root $serial_samsung $serial_array_NAS" # automate?
+    # # #
+    # Networking
+    # # #
+    wired_devices_mask="eth"
+    wireless_devices_mask="" # remove?
+    
+
+#    if [ "$@" != "" ]; then
+#        true        
+#    fi
+    
+    cecho "green" "OK"
+}
+
+# checked
+function verbose {
+    if [ "$#" == "2" ]; then
+        local color="${1:-default}"
+        local message="${2:-}"
+        
+        if [ "$verbose" == "yes" ]; then
+            if [ "$color" == "blue" -o "$color" == "default" -o "$color" == "green" -o "$color" == "light_blue" -o "$color" == "red" -o "$color" == "yellow" -o  "$color" == "-blue" -o "$color" == "-default" -o "$color" == "-green" -o "$color" == "-light_blue" -o "$color" == "-red" -o "$color" == "-yellow" ]; then
+                if [ -n "$message" ]; then
+                    cecho "$color" "$message"
+                else
+                    cecho "red" "[ -n $message ]\nPlease set the \"message\" argument for \"verbose\" function properly and try again, exiting!"
+                    exit_error
+                fi
+            else
+                cecho "red" "[ $color != blue -a $color != default -a $color != green -a $color != light_blue -a $color != red -a $color != yellow -a  $color != -blue -a $color != -default -a $color != -green -a $color != -light_blue -a $color != -red -a $color != -yellow ]\nPlease set the \"color\" argument for \"verbose\" function properly and try again, exiting!"
+                exit_error
+            fi
+        elif [ "$verbose" != "no" -a "$verbose" != "yes" ]; then
+            cecho "red" "[ $verbose != no -a $verbose != yes ]\nPlease set the global \"verbose\" variable in \"set_variables\" function properly and try again, exiting!"
+            exit_error
+        fi
+    else
+        cecho "red" "[ $# != 2 ]\nPlease set the arguments for \"verbose\" function properly and try again, exiting!"
+        exit_error
+    fi
+}
+
+if [ "$0" == "/init" ]; then
     set_variables
     configure_terminal
     mount_filesystems
-	install_busybox
-    configure_network
-	open_devices "$serial_root"
-	check_lvm "laptop/root"
-	mount_root "laptop/root"    
-    run_command "restore_root laptop/root_backup laptop/root yes" "[ ! -f /mnt/laptop-root/sbin/init ]" "Checking if /mnt/laptop-root/sbin/init exists" "" ""
+        if [ "$(cat /sys/devices/virtual/dmi/id/product_name)" == "Vostro1510" ]; then
+        serial_root="BTPR142000RB080BGN"
+    elif [ "$(cat /sys/devices/virtual/dmi/id/product_name)" == "Precision WorkStation T7500  " ]; then
+        serial_root="S2R5NB0HC09645T"
+    else
+        cecho "red" "Please add the serial number of the root device in the \"set_variables\" function and try again, exiting!"
+        lsblk -o+serial
+        exit_error
+    fi
+        
+install_busybox
+    #init_array
+    open_devices
+    #init_net
+    check_lvm "no" "$root_lv"
+    mount_root "$root_lv"
+    #mount_home "laptop/home"
     clean_up
-    exec switch_root /mnt/laptop-root /sbin/init' > "$initramfs_temp"/init
-	check_status
-	
-	if [ -x "$initramfs_temp/init" ]; then
-        verbose "$initramfs_temp/init already executable!" "red"
+    cp -r /lib/modules/$(uname -r) /mnt/laptop-root/lib/modules/
+    if [ -x "/mnt/laptop-root/sbin/init" -a -d "/mnt/laptop-root/etc/init.d/" ]; then
+        cecho "light_blue" "Starting Gentoo..."
+        exec switch_root /mnt/laptop-root /sbin/init
+    elif [ -f "/mnt/laptop-root/bin/busybox" ]; then
+        cecho "light_blue" "Starting busybox..."
+        exec switch_root /mnt/laptop-root /bin/busybox sh
     else
-        verbose "Making $initramfs_temp/init executable" "-b"
-        chmod +x $initramfs_temp/init
-        check_status
+        cecho "light_blue" "Something went wrong, no init or busybox found, exiting!"
+        exit_error
     fi
-        
-    for executable in $initramfs_files; do
-        verbose "Checking for $executable in the system" "-b"
-        if [ -f "$executable" ]; then
-            verbose "OK" "green"
-            if (ldd $executable &> /dev/null); then
-                verbose "$executable is a dynamic executable, additional files will be copied" "blue"
-                for file in $(lddtree -l $executable); do
-                    verbose "copying $file to $initramfs_temp$file" "-b"
-                    cp $file $initramfs_temp$file
-                    check_status
-                done
-            else
-                verbose "Copying $executable to $initramfs_temp$executable" "-b"
-                cp $executable $initramfs_temp$executable
-                check_status
-            fi
-        else
-            verbose "Failed!" "red"
-        fi
-    done
-            
-# https://hbr.org/2016/08/germanys-midsize-manufacturers-outperform-its-industrial-giants
-
-#CONFIG_NOUVEAU_DEBUG=y
-#CONFIG_NOUVEAU_DEBUG_DEFAULT=3
-#CONFIG_DRM_I2C_CH7006=y
-#CONFIG_DRM_I2C_SIL164=y
-#CONFIG_DRM_I2C_NXP_TDA998X=y
-#CONFIG_DRM_NOUVEAU=y
-#CONFIG_DRM_VGEM=y
-#CONFIG_FB_VGA16=y
-#CONFIG_FB_UVESA=y
-#CONFIG_FB_VESA=y
-#CONFIG_FB_RIVA=y
-#CONFIG_SENSORS_CORETEMP=y
-#CONFIG_CPU_THERMAL=y
-#CONFIG_SENSORS_CORETEMP=y
-#CONFIG_SENSORS_I5500=y
-#CONFIG_FB_NVIDIA_I2C=y
-#CONFIG_FB_NVIDIA_DEBUG=n
-#CONFIG_FB_NVIDIA_BACKLIGHT=y
-#CONFIG_NFSD_BLOCKLAYOUT=y
-#CONFIG_NFSD_SCSILAYOUT=y
-#CONFIG_NFSD_FLEXFILELAYOUT=y
-#CONFIG_FB_NVIDIA=y
-#CONFIG_CRYPTO_PCRYPT=y
-#CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE=y
-#CONFIG_CRYPTO_XTS=y
-#CONFIG_DM_CRYPT=y
-#ONFIG_INITRAMFS_ROOT_GID=0
-#CONFIG_NFSD=y
-#CONFIG_NFSD_V4=y
-#CONFIG_NFSD_V3_ACL=n
-#CONFIG_NFSD_PNFS=n
-#CONFIG_NFSD_V4_SECURITY_LABEL=n
-#CONFIG_NFSD_FAULT_INJECTION=n
-#CONFIG_R8169=y
-#CONFIG_RT2X00=y
-# CONFIG_RT2400PCI is not set
-# CONFIG_RT2500PCI is not set
-# CONFIG_RT61PCI is not set
-# CONFIG_RT2800PCI is not set
-# CONFIG_RT2500USB is not set
-# CONFIG_RT73USB is not set
-#CONFIG_RT2800USB=y
-# CONFIG_RT2800USB_RT33XX is not set
-# CONFIG_RT2800USB_RT35XX is not set
-# CONFIG_RT2800USB_RT3573 is not set
-# CONFIG_RT2800USB_RT53XX is not set
-# CONFIG_RT2800USB_RT55XX is not set
-# CONFIG_RT2800USB_UNKNOWN is not set
-# CONFIG_RT2X00_DEBUG is not set
-#CONFIG_SND_HDA_CODEC_REALTEK=y
-#
-# USB port drivers
-#
-#CONFIG_USB_SERIAL=y
-# CONFIG_USB_SERIAL_CONSOLE is not set
-# CONFIG_USB_SERIAL_GENERIC is not set
-# CONFIG_USB_SERIAL_SIMPLE is not set
-# CONFIG_USB_SERIAL_AIRCABLE is not set
-# CONFIG_USB_SERIAL_ARK3116 is not set
-# CONFIG_USB_SERIAL_BELKIN is not set
-#CONFIG_USB_SERIAL_CH341=y
-# CONFIG_USB_SERIAL_WHITEHEAT is not set
-# CONFIG_USB_SERIAL_DIGI_ACCELEPORT is not set
-# CONFIG_USB_SERIAL_CP210X is not set
-# CONFIG_USB_SERIAL_CYPRESS_M8 is not set
-# CONFIG_USB_SERIAL_EMPEG is not set
-# CONFIG_USB_SERIAL_FTDI_SIO is not set
-# CONFIG_USB_SERIAL_VISOR is not set
-# CONFIG_USB_SERIAL_IPAQ is not set
-# CONFIG_USB_SERIAL_IR is not set
-# CONFIG_USB_SERIAL_EDGEPORT is not set
-# CONFIG_USB_SERIAL_EDGEPORT_TI is not set
-# CONFIG_USB_SERIAL_F81232 is not set
-# CONFIG_USB_SERIAL_GARMIN is not set
-# CONFIG_USB_SERIAL_IPW is not set
-# CONFIG_USB_SERIAL_IUU is not set
-# CONFIG_USB_SERIAL_KEYSPAN_PDA is not set
-# CONFIG_USB_SERIAL_KEYSPAN is not set
-# CONFIG_USB_SERIAL_KLSI is not set
-# CONFIG_USB_SERIAL_KOBIL_SCT is not set
-# CONFIG_USB_SERIAL_MCT_U232 is not set
-# CONFIG_USB_SERIAL_METRO is not set
-# CONFIG_USB_SERIAL_MOS7720 is not set
-# CONFIG_USB_SERIAL_MOS7840 is not set
-# CONFIG_USB_SERIAL_MXUPORT is not set
-# CONFIG_USB_SERIAL_NAVMAN is not set
-# CONFIG_USB_SERIAL_PL2303 is not set
-# CONFIG_USB_SERIAL_OTI6858 is not set
-# CONFIG_USB_SERIAL_QCAUX is not set
-# CONFIG_USB_SERIAL_QUALCOMM is not set
-# CONFIG_USB_SERIAL_SPCP8X5 is not set
-# CONFIG_USB_SERIAL_SAFE is not set
-# CONFIG_USB_SERIAL_SIERRAWIRELESS is not set
-# CONFIG_USB_SERIAL_SYMBOL is not set
-# CONFIG_USB_SERIAL_TI is not set
-# CONFIG_USB_SERIAL_CYBERJACK is not set
-# CONFIG_USB_SERIAL_XIRCOM is not set
-# CONFIG_USB_SERIAL_OPTION is not set
-# CONFIG_USB_SERIAL_OMNINET is not set
-# CONFIG_USB_SERIAL_OPTICON is not set
-# CONFIG_USB_SERIAL_XSENS_MT is not set
-# CONFIG_USB_SERIAL_WISHBONE is not set
-# CONFIG_USB_SERIAL_SSU100 is not set
-# CONFIG_USB_SERIAL_QT2 is not set
-# CONFIG_USB_SERIAL_DEBUG is not set'
-    #if [ -f /usr/src/$(readlink /usr/src/linux)-$kernel_type/usr/initramfs_data.cpio.gz ]; then
-    #    rm /usr/src/$(readlink /usr/src/linux)-$kernel_type/usr/initramfs_data.cpio.gz
-    #    if [ "$?" == "0" ]; then
-    #        echo "deleted cpio"
-    #    fi
-    #fi
-}
-
-function create_partitions {
-    verbose "function create_partitions [$(echo $@)]" "yellow"
-    
-    verbose "Searching for 64MB boot partition" "-b"
-    if [ $(eval "blockdev --getsz /dev/\${dev_$serial_boot}1") == "131072" ]; then
-        check_status
-        #echo "blkdev size $(eval "blockdev --getsz /dev/\${dev_$serial_boot}1")"
-    else
-        echo -e "d\n1\nn\np\n1\n2048\n+64M\na\nw" | eval "fdisk /dev/\$dev_$serial_boot"
-        sleep 1
-    fi
-}
-
-function run_command {    
-    local command="${1:-}"
-    local condition=${2:-}
-    local message="${3:-}"
-    local permissible="${4:-}"
-    local resource="${5:-}"
-    
-    verbose "function run_command [command: $command, condiftion: $condition, message: $message, permissible: $permissible, resource: $resource]" "blue"
-
-    check_if_empty "$command"
-    
-    if $condition; then
-        if [ -z "$message" ]; then
-            verbose "executing command [$command]..." "-b"
-        else
-            verbose "$message..." "-b"
-        fi
-        eval "$command"
-        check_status "$resource"
-    else
-        cecho "$condition not true, exiting!" "red"
-        if [ "$permissible" == 0 ]; then
-        exit 1
-        fi
-    fi
-}
-
-function set_variables {
-    debug="no"
-    verbose="yes"
-    
-    verbose "function set_variables" "blue"
-    cecho "Setting variables..." "-lb"
-    
-    hardened="no"
-    initramfs_include_keys="yes"
-    initramfs_internet="yes"
-    initramfs_tools="yes"
-    # 8GB tiny: 20CF302E23E4FCA0AC111014
-    # HP SSD: 161173400961
-    # Rachels doc: 1D225620 
-    # Samsung SSD: S2R5NB0HC09645T 
-    serial_boot="20CF302E23E4FCA0AC111014"
-    serial_keys="797CE8BB"
-    serial_keys_backup="20CF302E23E4FCA0AC111014"
-    serial_root="S2R5NB0HC09645T"
-    cecho "OK" "green"
-}
-
-
-function del_key {
-    local serial="${1:-}"
-    verbose "function del_key[serial: $serial]" "yellow"
-    check_if_empty "$serial"
-    
-    ls -lhRI lost+found /mnt/"$serial"
-    echo "Enter name of the key to delete:"
-    local key_name
-    read key_name
-    
-    if [ -n "$key_name" ]; then
-        if [ -d /mnt/"$serial"/"$key_name" ]; then
-            run_command "rm -r /mnt/$serial/$key_name" "" "Deleteing key $key_name" "0" ""
-        else
-            cecho "key not found, please try again" "yellow"
-        fi
-    else
-        cecho "key name empty, please try again" "yellow"
-        del_key "$serial"
-    fi
-}
-
-     function erase_dev {
-        local serial="${1:-}"
-        local type="${2:-}"
-        
-        verbose "function erase_dev [serial: $serial, type: $type]" "blue"
-
-        check_if_empty "$serial"
-        
-        if [ "$hardened" == "yes" ]; then
-            verbose "hardened=yes, using /dev/urandom" "blue"
-            local source=/dev/urandom
-        elif [ "$hardened" == "no" ]; then
-            verbose "hardened=no, using /dev/zero" "blue"
-            local source=/dev/zero
-        else
-            cecho "hardened variable not set to [no/yes], exiting!" "red"
-            exit 1
-        fi
-
-        get_dev_geometry "$serial"
-
-        if [ "$type" == "luks" ]; then
-            local device=/dev/mapper/$serial
-        else
-            local device=$(eval "echo /dev/\$dev_$serial")
-        fi
-        
-        verbose "using device $device" "blue"
-        
-        check_for_program "/bin/dd --version"
-        
-        if (dd count=1 if=/dev/zero of=/dev/null status=progress &> /dev/null); then
-            local dd_opts="status=progress"
-        fi
-        cecho "About to erase $device, please confirm with [ENTER]" "yellow"
-        read
-        cecho "Erasing device $device with $(eval echo \$sector_count_$serial) 512B sectors using $source..." "light_blue"
-#        run_command "/bin/dd if=$source of=$device bs=512 count=\$sector_count_$serial ${dd_opts:-}" "[ -b $device ]" "0" ""
-        run_command "/bin/dd if=$source of=$device bs=512 count=1 ${dd_opts:-}" "[ -b $device ]" "0" ""
-        cecho "OK" "green"
-    }
-
-function exit_trap {
-	local exit_code="$?"
-    
-    verbose "function exit_trap [$exit_code]" "yellow"
-    
-	if [ "$verbose" == "yes" ]; then
-		if [ "$exit_code" == "0" ]; then verbose "Exiting gracefully" "green"; else verbose "Command [$BASH_COMMAND] has exited with code [$exit_code]" "red"; fi
-	else
-		if [ "$exit_code" != "0" ]; then echo "/init error has occured, please enable verboseging for more information"; fi
-	fi
-	
-	clean_up
-}
-
-function format_dev {
-    local ser_or_dev="${1:-}"
-    local filesystem="${2:-}"
-    verbose "function format_dev[ serial or device: $ser_or_dev, file system: $filesystem ]"
-
-	if eval [ -b /dev/mapper/"$ser_or_dev" ]; then
-		local device="/dev/mapper/$ser_or_dev"
-	elif eval [ -b /dev/"$ser_or_dev" ]; then
-		local device="/dev/$ser_or_dev"
-	elif eval "[ -b /dev/\$dev_$ser_or_dev ]"; then
-		local device="/dev/\$dev_$ser_or_dev"
-	fi
-	verbose "Using $device" "blue"
-	
-	if [ -z "$filesystem" ]; then
-        local fstype
-        while [ "${fstype:-}" != "ext2" -a "${fstype:-}" != "ext4" ]; do
-            echo "Please choose filesystem type[ext2/ext4]."
-            read fstype
-        done
-        verbose "Formatting $device with $fstype"
-        eval mkfs."$fstype" "$device" > /dev/null
-	elif [ "$filesystem" == "ext2" ]; then
-        if (eval "fsck $device"); then
-            verbose "echo $device seems to already formatted, would you like to format again[no/yes]?" "blue"
-			local answer
-            read answer
-			if [ "$answer" == "yes" ]; then
-                eval "mkfs.ext2 -q $device"
-			elif [ "$answer" != "no" -a "$answer" != "yes" ]; then
-				format_dev "$@"
-			fi
-        else
-            run_command "eval mkfs.ext2 -q $device" "" "Formatting $device as ext2" "0" ""
-        fi
-	elif [ "$filesystem" == "ext4" ]; then
-		verbose "Formatting $device with ext4 filesystem"
-        local fstype=$(eval "blkid -o value -s TYPE $device")
-        if [ "$fstype" == "ext4" ]; then
-            verbose "echo $device seems to already formatted, would you like to format again[yes/no]?" "blue"
-			local answer="no"
-            $(read -t 1 -p no answer; true)
-            #echo answer:$answer
-			if [ "$answer" == "yes" ]; then
-                eval "mkfs.ext4 -q $device"
-			elif [ "$answer" != "yes" -a "$answer" != "no" ]; then
-				format_dev "$@"
-			fi
-        else
-            eval "mkfs.ext4 -q $device"
-        fi
-	elif [ "$filesystem" == "luks" ]; then
-		local exit_code=$(eval "cryptsetup isLuks $device"; echo "$?")
-		if [ "$exit_code" == "0" ]; then
-			verbose "$device seems to be a LUKS device already, would you like to format anyway[no/yes]?" "blue"
-			local answer="no"
-            $(read -t 1 answer; true)
-			if [ "$answer" == "yes" ]; then
-				run_command "cryptsetup luksFormat $device" "" "Formatting $device as LUKS" "0" "$device"
-			elif [ "$answer" != "yes" -a "$answer" != "no" ]; then
-				format_dev "$@"
-			fi
-		else
-            run_command "cryptsetup luksFormat $device" "" "Formatting $device as LUKS" "0" ""
-		fi
-	fi
-}
-
-function gen_key {
-    local serial=${1:-}
-    verbose "function gen_key[serial: $serial]" "blue"
-    check_if_empty "$serial"
-    
-    echo "Please enter new key name:"
-    local key_name
-    read key_name
-    if [ -n "$key_name" ]; then
-        if [ ! -d /mnt/"$serial"/"$key_name" ]; then
-            mkdir /mnt/"$serial"/"$key_name"
-            
-            if [ "$hardened" == "no" ]; then
-                local device="/dev/urandom"
-            elif [ "$hardened" == "yes" ]; then
-                local device="/dev/random"
-            else
-                cecho "hardened variable not set[no/yes], exiting!" "red"
-                exit 1
-            fi
-            
-            cecho "Creating key $key_name..." "-lb"
-            dd if=/dev/zero of=/mnt/"$serial"/"$key_name"/"$key_name" bs=1k count=1032 &> /dev/null
-            dd if="$device" of=/mnt/"$serial"/"$key_name"/"$key_name".key bs=1 count=4096 status=progress
-
-            dd if=/dev/zero of=/mnt/"$serial"/"$key_name"/"$key_name".header bs=1k count=1028 &> /dev/null
-            
-            cryptsetup luksFormat --align-payload=2056 --key-file /mnt/"$serial"/"$key_name"/"$key_name".key -q /mnt/"$serial"/"$key_name"/"$key_name"
-            cryptsetup luksOpen --key-file /mnt/"$serial"/"$key_name"/"$key_name".key /mnt/"$serial"/"$key_name"/"$key_name" "$key_name"
-            check_status "$key_name"
-
-            if [ -f $key_name ]; then
-                verbose "Importing key" "blue"
-                dd if="$key_name" of=/dev/mapper/"$key_name" bs=1 count=4096 status=progress
-            else
-                verbose "Creating key" "blue"
-                dd if="$device" of=/dev/mapper/"$key_name" bs=1 count=4096 status=progress
-            fi
-            
-            cryptsetup luksFormat --header /mnt/"$serial"/"$key_name"/"$key_name".header --key-file /dev/mapper/"$key_name" -q /dev/loop0
-            cecho "OK" "green"
-        else
-            cecho "key $key_name already exists!" "red"
-            exit 1
-        fi
-    else
-        cecho "no key name provided, please try again" "yellow"
-        gen_key "$serial"
-    fi
-}
-	
-function get_dev_name {
-        local serials=${@:-}
-        verbose "function get_dev_name [serials: $serials]" "blue"
-        check_if_empty "$serials"
-        
-        check_for_program "lsblk --version"
-        check_for_program "sg_vpd --help"
-        
-        sleep 2
-        
-        for serial in $serials; do
-            local found="0"
-
-            cecho "Searching for device with serial $serial..." "-lb"
-            local device
-            for device in $(ls /sys/block/); do
-                verbose "Trying $device" "blue"
-                if [ -n "$(cat /sys/block/$device/device/vpd_pg80 2>/dev/null | cut -c2- | tail -n1 | tr -d '[:space:]')" ]; then
-                    local serial2=$(cat /sys/block/$device/device/vpd_pg80 | cut -c2- | tail -n1 | tr -d '[:space:]')
-                    if [ "$serial" == "$serial2" ]; then
-                        verbose "Found device: $device, serial: $serial, serial2: $serial2 from vpd_pg80" "blue"
-                        export dev_$serial="$device"
-                        found="1"
-                        continue
+elif [ "$0" == "./cu_boot.sh" ]; then
+    set_variables "$@"
+    configure_terminal
+    while ! [ "${1:-}" == "test" -o "${1:-}" == "test verbose" ]; do
+        echo "Please select an operation to perform from the list and confirm with ENTER:"
+        cecho "yellow" "a) Create a key"
+        cecho "yellow" "i) Import a key"
+        cecho "yellow" "r) Remove a key"
+        cecho "yellow" "b) Backup keys"
+        cecho "yellow" "l) List keys"
+        cecho "yellow" "lb) List backup keys"
+        cecho "yellow" "D) Erase device"
+        cecho "yellow" "B) Erase the boot drive"
+        cecho "yellow" "K) Erase the key drive"
+        cecho "yellow" "Kb) Erase the key backup drive"
+        cecho "yellow" "L) Create laptop boot drive"
+        cecho "yellow" "N) Create NAS boot drive"
+        cecho "yellow" "G) Install Gentoo"
+        cecho "yellow" "q) Quit"
+        read input
+        case $input in
+            a)  open_luks "$serial_keys"
+                mount_dev "/dev/mapper/$serial_keys"
+                gen_keys "$serial_keys" ""
+                clean_up # checking
+                ;;
+            i)  open_luks "$serial_keys"
+                mount_dev "/dev/mapper/$serial_keys"
+                gen_keys "$serial_keys" ""
+                clean_up
+                ;;
+            l)  open_luks "$serial_keys"
+                mount_dev "/dev/mapper/$serial_keys"
+                list_keys /mnt/"$serial_keys"
+                clean_up
+                ;;
+            lb) open_luks "$serial_keys_backup"
+                mount_dev "/dev/mapper/$serial_keys_backup"
+                list_keys /mnt/"$serial_keys_backup"
+                clean_up
+                ;;
+            r)  open_luks "$serial_keys"
+                mount_dev "/dev/mapper/$serial_keys"
+                del_key "$serial_keys"
+                clean_up
+                ;;
+            b)  open_luks "$serial_keys_backup" "$serial_keys"
+                mount_dev "/dev/mapper/$serial_keys_backup" "/dev/mapper/$serial_keys" # checking
+                cecho "-light_blue" "Copying keys..."
+                run_command "rsync -av --exclude lost+found /mnt/$serial_keys/ /mnt/$serial_keys_backup/" "[ -d /mnt/$serial_keys/ ] && [ /mnt/$serial_keys_backup/ ]" "Failed to copy keys!" "Copying keys..." "fail_on_condition" ""
+                cecho "green" "OK"
+                clean_up
+                ;;
+            L)  create_partitions "$serial_boot"
+                open_luks $(eval echo \${dev_$serial_boot}1)
+                mount_dev "/dev/mapper/$(eval basename \${dev_$serial_boot}1)"
+                build_kernel "x86_64"
+                if [ -f /etc/default/grub ]; then
+                    if [ -z $(cat /etc/default/grub | grep "GRUB_ENABLE_CRYPTODISK=y") ]; then
+                        echo updating grub
+                        echo "GRUB_ENABLE_CRYPTODISK=y" >> /etc/default/grub;
                     fi
-                elif [ -n "$(lsblk -ndoname,serial | grep $device | awk '{print $2}')" ] && [ "$found" == "0" ]; then
-                    local serial2=$(lsblk -ndoname,serial | grep $device | awk '{print $2}')
-                    if [ "$serial" == "$serial2" ]; then
-                        verbose "Found device: $device, serial: $serial, serial2: $serial2 from lsblk" "blue"
-                        export dev_$serial="$device"
-                        found="1"
-                        continue
-                    fi
-                elif (sg_vpd /dev/$device &> /dev/null) && [ "$found" == "0" ]; then
-                    serial2="$(sg_vpd -p sn -r /dev/$device)"
-                    serial2=$(echo "$serial2" | cut -c4- | rev | cut -c2- | rev)
-                    if [ "$serial" == "$serial2" ]; then
-                        verbose "Found device: $device, serial: $serial, serial2: $serial2 from sg_vpd" "blue"
-                        export dev_$serial="$device"
-                        found="1"
-                        continue
-                    fi
+                else
+                    install_package "grub"
+                    echo "GRUB_ENABLE_CRYPTODISK=y" >> /etc/default/grub;
+                    #cecho "Install grub!" "red"
+                    #exit_error
                 fi
-            done
-
-            if [ "$found" == "1" ]; then
-                cecho "OK" "green"
-            else
-                check_status "" "Device with serial $serial not found!"
-            fi
-        done
-}
-
-function get_dev_geometry {
-    serial=${1:-}
-    check_if_empty "$serial"
-	verbose "function get_dev_geometry [serial: $serial]" "blue"
-	
-	get_dev_name "$@"
-	
-	for serial in $@; do
-		verbose "Obtaining sector count for $serial" "blue"
-		local sector_count=$(eval "blockdev --getsz /dev/\$dev_$serial")
-		export sector_count_$serial="$sector_count"
-	done
-}
-
-function open_luks {	
-	local arguments="${1:-}"
-	local type="$2"
-	verbose "function open_luks [arguments: $arguments, type: $type]" "blue"
-    check_if_empty "$arguments" "$type"    
-    check_for_program "cryptsetup --version"
-    
-    for argument in $arguments; do
-    cecho "Openning $(eval echo $argument...)" "-lb"
-    if [ "$type" == "device" ]; then
-        if eval [ -b /dev/"$argument" ]; then
-            verbose "Attempting to open device /dev/$argument as /dev/mapper/$argument" "-b"
-            eval cryptsetup luksOpen /dev/"$argument" "$argument"
-            check_status $(eval echo "$argument")
-        else
-            verbose "/dev/$argument does not exist, exiting!" "red"
-            exit 1
-        fi
-    elif [ "$type" == "serial" ]; then
-        get_dev_name "$argument"
-        run_command "[ -b /dev/\$dev_$argument ]" "" "Checking if $( eval echo \$dev_$argument) exists" "0" ""
-        if (eval cryptsetup isLuks /dev/\$dev_$argument); then
-            run_command "cryptsetup luksOpen /dev/\$dev_$argument $argument" "" "Attempting to open /dev/\$dev_$argument as /dev/mapper/$argument" "0" "/dev/mapper/$argument"
-        else
-            if [ "$hardened" == "yes" ]; then
-                erase_dev "$argument"
-            fi
-            format_dev "$argument" "luks"
-            open_luks "$argument" "serial"
-            if [ "$hardened" == "yes" ]; then
-                erase_dev "$argument" "luks"
-            fi
-        fi
-    elif [ "$type" == "key" ]; then
-        verbose "Attempting to open key $argument as /dev/mapper/key_$argument" "-b"
-        if [ -d /opt/keys/"$argument" ]; then
-            cryptsetup luksOpen --key-file=/opt/keys/"$argument"/"$argument".key /opt/keys/"$argument"/"$argument" "key_$argument"
-            check_status "key_$argument"
-        elif [ -n "$serial_keys" ] && [ -d /mnt/"$serial_keys"/"$argument" ]; then
-            cryptsetup luksOpen --key-file=/mnt/"$serial_keys"/"$argument"/"$argument".key /mnt/"$serial_keys"/"$argument"/"$argument" "key_$argument"
-            check_status " $argument"
-        else
-            cecho "key $argument does not exist, exiting!" "red"
-            exit 1
-        fi
-    fi
-    cecho "OK" "green"
+                if (eval "grub-install \$dev_$serial_boot"); then cecho "green" "OK"; else cecho "red" "grub-install has failed, exiting!"; exit_error; fi
+                if (grub-mkconfig -o /boot/grub/grub.cfg); then cecho "green" "config OK"; else cecho "red" "config has failed, exiting!"; exit_error; fi
+                clean_up
+                ;;
+            N)  create_partitions "$serial_boot"
+                open_luks $(eval echo \${dev_$serial_boot}1)
+                mount_dev "/dev/mapper/$(eval basename \${dev_$serial_boot}1)"
+                build_kernel "arm"
+                if (eval "grub-install \$dev_$serial_boot"); then echo ok; else echo grub-install has failed; clean_up; fi
+                if (grub-mkconfig -o /boot/grub/grub.cfg); then echo config ok; else echo config has failed; clean_up; fi
+                clean_up
+                ;;
+            G)  echo -e "Please choose device from the list:\n$(lvm lvs --noheadings -olv_full_name,size 2>/dev/null)"
+                read device
+                while (! lvm lvs $device &> /dev/null); do
+                    cecho "yellow" "$device not found, please try again"
+                    read device
+                done
+                if [ ! -b "/dev/$device" ]; then
+                    DM_DISABLE_UDEV=1 lvm lvchange -ay "$device"
+                fi
+                format_dev "/dev/$device" ""
+                mount_dev "/dev/mapper/$(echo $device | sed s:/:-:)"
+                install_gentoo "/mnt/$(echo $device | sed s:/:-:)"
+                unset device
+                clean_up
+                ;;
+            D)  erase_dev "choose"
+                ;;
+            B)	check_if_device_with_serial_exists "$serial_boot"
+                erase_dev $(eval echo \$dev_$serial_boot)
+                ;;
+            K)	check_if_device_with_serial_exists "$serial_keys"
+                erase_dev $(eval echo \$dev_$serial_keys)
+                ;;
+            Kb)	check_if_device_with_serial_exists "$serial_keys_backup"
+                erase_dev $(eval echo \$dev_$serial_keys_backup)
+                ;;
+            q) 	exit
+                ;;
+            *)	cecho "yellow" "Please choose a valid option from the list!"
+                ;;
+        esac
     done
-}
-
-function mount_dev {
-	local serials="${1:-}"
-	local size="${2:-}"
-
-	verbose "function mount_dev [serials: $serials, size: $size]" "blue"
-
-	for serial in $serials; do
-	cecho "Mounting $(eval echo $serial...)" "-lb"
-	if [ -n "$size" ]; then
-        local mount_point="$serial"
-        run_command "mkdir $mount_point" "[ ! -d $mount_point ]" "$mount_point does not exist, creating" "0" "$mount_point"
-        run_command "mount -o size=$size -t tmpfs tmpfs $mount_point" "" "Creating $size RAMdisk at $mount_point" "0" "$mount_point"
-	elif [ "$serial" == "$serial_root" ]; then
-        verbose "Mounting mount -o bind /mnt/$serial_keys/$serial_root/ /usr/src/$(readlink /usr/src/linux)-laptop/initramfs/$serial_root"
-        if [ ! -d /usr/src/$(readlink /usr/src/linux)-laptop/initramfs/"$serial_root" ]; then
-            mkdir /usr/src/$(readlink /usr/src/linux)-laptop/initramfs/opt/keys/"$serial_root"
-        fi
-        mount -o bind /mnt/"$serial_keys"/"$serial_root" /usr/src/$(readlink /usr/src/linux)-laptop/initramfs/opt/keys/"$serial_root"
-        if [ "$?" == "0" ]; then
-            resources_to_clean=$(echo /usr/src/$(readlink /usr/src/linux)-laptop/initramfs/opt/keys/"$serial_root" ${resources_to_clean:-})
-        fi
-	elif [ -b /dev/mapper/"$serial" ]; then
-        run_command "mkdir /mnt/$serial" "[ ! -d /mnt/$serial ]" "/mnt/$serial does not exist, creating..." "" "/mnt/$serial"
-        verbose "Mounting /dev/mapper/$serial at /mnt/$serial" "blue"        
-        if (mount /dev/mapper/$serial /mnt/$serial &> /dev/null); then
-            if [ "$serial" != "laptop-root" ]; then
-                check_status "/mnt/$serial"
-            fi
-        else
-            format_dev "$serial"
-            mount_dev "$serial"
-		fi
-	elif eval [ "$serial" == "\${dev_$serial_boot}1" ]; then
-        verbose "Mounting /dev/mapper/$serial at /boot" "blue"
-        if (eval mount /dev/mapper/$serial /boot &> /dev/null); then
-            check_status "/boot"
-        else
-            format_dev "$serial"
-            mount_dev "$serial"
-		fi
-    else
-        cecho "$serial not found, exiting!" "red"
+    if [ "${1:-}" == "test" -o "${1:-}" == "test verbose" ]; then
+        build_kernel "x86_64"
+        clean_up
+        check_for_program "qemu-system-x86_64 --version"
+        qemu-system-x86_64 -kernel kernel+initramfs
+        rm kernel+initramfs
     fi
-    cecho "OK" "green"
-    done
-}
-
-function verbose {
-    local color=${2:-default}
-    local message="${1:-}"
-
-    if [ "$verbose" == "yes" ]; then
-        cecho "$message" "$color"
-    elif [ "$verbose" != "no" ] && [ "$verbose" != "yes" ]; then
-        cecho "verbose not set to [no/yes], exiting!" "red"
-        exit 1
-    fi
-}
-
-function build_NAS {
-    #arm_root="/home/user/diskless"
-    #keys="array S2R8J9DC911615"
-    #NAS_kernel_config="mvebu_v5_defconfig"
-    #kernel_load_address=0x200000
-
-function exit_trap {
-	local exit_code=$?
-        if [ $exit_code != 0 ]; then echo "Command [$BASH_COMMAND] exited with code [$exit_code]"
-        	verbose "Cleaning up!"
-        	#if [ -d $initramfs_temp ]; then verbose "Deleting $initramfs_temp"; rm -r $initramfs_temp; fi
-        	#if [[ -n $(cat /proc/mounts | grep $temp) ]]; then umount $temp; fi
-        	#if [ -e $temp ]; then rm -r $temp; fi
-        	#if [[ -n $(cat /proc/mounts | grep /dev/mappper/keys) ]]; then umount /dev/mapper/keys; fi
-        	#if [ -b /dev/mapper/keys ]; then cryptsetup close /dev/mapper/keys; fi
-        	#if [ -b /dev/mapper/$boot_serial ]; then cryptsetup close /dev/mapper/$boot_serial; fi
-	fi
-}
-
-
-if [ "$1" == "update" ]; then echo "Updating the kernel..."; verbose "Deleting /usr/src/linux-NAS and /usr/src/linux-*-NAS"; rm /usr/src/linux-NAS; rm -r /usr/src/linux-*-NAS; fi
-
-if [ ! -L /usr/src/linux-NAS ]; then
-	if [ -d /usr/src/linux ]; then kernel_dir=$(readlink /usr/src/linux); verbose "$kernel_dir has been found"; else echo "/usr/src/linux is missing. Please install kernel sources"; exit 0; fi
-
-	verbose "Creating $kernel_dir-NAS directory"
-	mkdir /usr/src/$kernel_dir-NAS
-
-	verbose "Updating kernel-NAS symlink"
-	ln -s /usr/src/$kernel_dir-NAS /usr/src/linux-NAS
-
-	verbose "Copying $kernel_dir to $kernel_dir-NAS"
-	cp -r /usr/src/$kernel_dir/* /usr/src/$kernel_dir-NAS/
+else
+    cecho "red" "Please execute as ./cu_boot or /init, exiting!"
 fi
-
-echo "Building the kernel..."
-
-verbose "Entering /usr/src/linux-NAS"
-cd /usr/src/linux-NAS
-
-verbose "Configuring $kernel_dir"
-ARCH="arm" make $kernel_config
-
-
-verbose "Applying configuration changes needed for the NAS"
-# Cross compiler
-sed -i 's/CONFIG_CROSS_COMPILE=""/CONFIG_CROSS_COMPILE="armv5te-softfloat-linux-gnueabi-"/g' /usr/src/linux-NAS/.config
-# Initramfs
-if [[ $initramfs == y ]]; then
-	echo 'CONFIG_BLK_DEV_INITRD=y' >> /usr/src/linux-NAS/.config
-	echo 'CONFIG_INITRAMFS_SOURCE="/tmp/initramfs"' >> /usr/src/linux-NAS/.config
-	echo 'CONFIG_RD_GZIP=y' >> /usr/src/linux-NAS/.config
-	echo 'CONFIG_RD_BZIP2=n' >> /usr/src/linux-NAS/.config
-	echo 'CONFIG_RD_LZMA=n' >> /usr/src/linux-NAS/.config
-	echo 'CONFIG_RD_XZ=n' >> /usr/src/linux-NAS/.config
-	echo 'CONFIG_RD_LZO=n' >> /usr/src/linux-NAS/.config
-	echo 'CONFIG_RD_LZ4=n' >> /usr/src/linux-NAS/.config
-	echo 'CONFIG_INITRAMFS_ROOT_UID=0' >> /usr/src/linux-NAS/.config
-	echo 'CONFIG_INITRAMFS_ROOT_GID=0' >> /usr/src/linux-NAS/.config
-fi
-# Size optimalization
-echo 'CONFIG_CC_OPTIMIZE_FOR_SIZE=y' >> /usr/src/linux-NAS/.config
-# MD/crypto
-
-echo 'CONFIG_MD=y
-CONFIG_BLK_DEV_MD=y
-CONFIG_MD_AUTODETECT=y
-CONFIG_MD_LINEAR=n
-CONFIG_MD_RAID0=n
-CONFIG_MD_RAID1=y
-CONFIG_MD_RAID10=n
-CONFIG_MD_RAID456=n
-CONFIG_MD_MULTIPATH=y
-# CONFIG_MD_FAULTY is not set
-# CONFIG_BCACHE is not set
-CONFIG_BLK_DEV_DM=y
-CONFIG_DM_MQ_DEFAULT=y
-# CONFIG_DM_DEBUG is not set
-CONFIG_DM_CRYPT=y
-CONFIG_DM_SNAPSHOT=y
-# CONFIG_DM_THIN_PROVISIONING is not set
-# CONFIG_DM_CACHE is not set
-# CONFIG_DM_ERA is not set
-CONFIG_DM_MIRROR=y
-# CONFIG_DM_LOG_USERSPACE is not set
-CONFIG_DM_RAID=y
-# CONFIG_DM_ZERO is not set
-CONFIG_DM_MULTIPATH=y
-# CONFIG_DM_MULTIPATH_QL is not set
-# CONFIG_DM_MULTIPATH_ST is not set
-# CONFIG_DM_DELAY is not set
-CONFIG_DM_UEVENT=y
-# CONFIG_DM_FLAKEY is not set
-# CONFIG_DM_VERITY is not set
-# CONFIG_DM_SWITCH is not set
-# CONFIG_DM_LOG_WRITES is not set
-CONFIG_ASYNC_RAID6_TEST=n
-# XTS
-CONFIG_CRYPTO_XTS=y' >> /usr/src/linux-NAS/.config
-
-if [[ $initramfs == y ]]; then
-	verbose "Creating $initramfs_temp"
-	if [ ! -d $initramfs_temp ]; then
-        mkdir $initramfs_temp;
-    fi
-
-	for directory in $initramfs_dirs; do verbose "Creating $initramfs_temp$directory..."; mkdir $initramfs_temp$directory; done
-
-	echo "Copying files"
-	for executable in $initramfs_files; do echo "Copying $arm_root$executable"; cp $arm_root$executable $initramfs_temp$executable; done
-	mv $initramfs_temp/sbin/lvm.static $initramfs_temp/sbin/lvm
-
-	verbose "Creating $initramfs_temp/init"
-	echo '#!/bin/busybox sh
-
-	get_keys () {
-		local key_id="$1"
-		verbose "Downloading key $key_id"
-		tftp -g -l /opt/keys/$key_id/$key_id -r keys/$key_id/$key_id $NAT &> /dev/null || continue
-		verbose "Downloading header $serial.header"
-		tftp -g -l /opt/keys/$key_id/$key_id.header -r keys/$key_id/$key_id.header $NAT &> /dev/null || continue
-	}
-
-	open_luks () {
-        local device
-		for device in $(ls /dev/[m,s]d?); do
-			verbose "Searching for $device key ID"
-			if [ $device == /dev/md0 ]; then verbose "Found array"; local key_id="array"; get_keys "$key_id"
-			else
-				if (cat /sys/block/$(basename $device)/device/vpd_pg80 &> /dev/null); then local key_id=$(cat /sys/block/$(basename $device)/device/vpd_pg80 | cut -c2- | tr -d "\n" | tr -d " "); verbose "Found $key_id"; get_keys "$key_id"
-				else
-					local key_id=$(cat /sys/block/$(basename $device)/device/model | tr -d " ")
-					if [ -n "$key_id" ]; then verbose "Found $key_id"; get_keys "$key_id"; else continue; fi
-				fi
-			fi
-			verbose "Attempting to open keys $key_id"
-			cryptsetup luksOpen --header /opt/keys/$key_id/$key_id.header --key-file /opt/keys/$key_id/$key_id.key /opt/keys/$key_id/$key_id key_$key_id
-			verbose "Creating /mnt/$key_key_id directory"
-			mkdir /mnt/key_$key_id
-			verbose "Mounting key_$key_id in /mnt/key_$key_id"
-			mount /dev/mapper/key_$key_id /mnt/key_$key_id
-			verbose "Openning $key_id"
-			cryptsetup luksOpen --header /mnt/key_$key_id/$key_id.header --key-file /mnt/key_$key_id/$key_id.key $device $key_id || continue
-			verbose "Umounting key_$serial"
-			umount /dev/mapper/key_$key_id
-			verbose "Deleting /mnt/key_$serial directory"
-			rmdir /mnt/key_$key_id
-			cryptsetup close key_$key_id
-			if (lvm pvck /dev/mapper/$key_id); then
-				verbose "lvm on $key_id OK"
-			else
-				verbose "lvm not found, initializing httpd"
-				export key_id
-				httpd -h /var/www
-				sleep 180;
-				while (pgrep -f "busybox dd"); do sleep 1; done
-				killall httpd
-				if [ -f /var/www/dd.log ]; then lvm pvcreate /dev/mapper/$key_id; fi
-			fi
-		done
-	}
-
-	rescue_shell () {
-		local exit_code=$?
-		echo "Something went wrong[$exit_code], dropping into a shell"
-		exec sh
-	}
-
-	verbose "Installing busybox..."
-	/bin/busybox --install || rescue_shell
-
-	verbose "Mounting /dev..."
-	mount -t devtmpfs none /dev || rescue_shell
-	verbose "Mounting /proc..."
-	mount -t proc none /proc || rescue_shell
-	verbose "Mounting /sys..."
-	mount -t sysfs none /sys || rescue_shell
-
-	verbose "Trying to assemble the array..."
-	#mdadm --assemble --scan --name=0
-	#sleep 10
-
-	#open_luks
-
-	#lvm lvchange -ay 1TB/root
-	#lvm vgscan --mknodes
-	#fsck.ext4 /dev/1TB/root
-	sh
-	mount /dev/1TB/root /mnt/root || rescue_shell
-
-	verbose -e "Cleaning up\numounting /dev..."
-	umount /dev || rescue_shell
-	verbose -e "Umounting /proc..."
-	umount /proc 
-	verbose -e "Umounting /sys..."
-	umount /sys
-	exec switch_root /mnt/root /sbin/init' > $initramfs_temp/init
-
-	echo "Making $initramfs_temp/init executable"
-	chmod +x $initramfs_temp/init
-
-	verbose "Creating $initramfs_temp/etc/mtab"
-	touch $initramfs_temp/etc/mtab
-
-	mknod -m 600 $initramfs_temp/dev/console c 5 1
-
-echo '<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta http-equiv="refresh" content="0;url=./cgi-bin/index.sh">
-<title>NAS administration</title>
-</head>
-
-<body>
-<p>Automatically redirecting to the CGI script</p>
-</body>
-
-</html>' >> $initramfs_temp/var/www/index.html
-
-echo '#!/bin/busybox sh' >> $initramfs_temp/var/www/cgi-bin/index.sh
-echo 'echo "Content-type: text/html"' >> $initramfs_temp/var/www/cgi-bin/index.sh
-echo 'echo ""' >> $initramfs_temp/var/www/cgi-bin/index.sh
-echo 'echo "<p> $key_id doesnt contain a valid lvm label. Please initialize the drive.<br> WARNING! This will erase all data on the drive </p>"' >> $initramfs_temp/var/www/cgi-bin/index.sh
-echo 'echo "<form action="./format.sh">
-    <input type="submit" value="Format the drive" />
-</form>"' >> $initramfs_temp/var/www/cgi-bin/index.sh
-chmod +x $initramfs_temp/var/www/cgi-bin/index.sh
-
-echo '#!/bin/busybox sh
-echo ""
-echo "<!DOCTYPE html>"
-echo "<html>"
-echo "<head>"
-echo "<title>Title of the document</title>"
-echo "</head>"
-
-echo "<body>"
-if [ ! -f /var/www/dd.log ]; then
-        busybox dd if=/dev/zero of=/dev/mapper/$key_id bs=1M > /var/www/dd.log 2>&1 &
-fi
-kill -USR1 $(pgrep -f "busybox dd")
-echo "<pre>"
-cat /var/www/dd.log
-echo "</pre>"
-echo "" > /var/www/dd.log
-echo "</body>"
-echo "</html>"' >> $initramfs_temp/var/www/cgi-bin/format.sh
-chmod +x $initramfs_temp/var/www/cgi-bin/format.sh
-fi
-
-echo "Compiling linux-NAS"
-
-ARCH="arm" make uImage LOADADDR=$kernel_load_address
-
-if [[ $initramfs == y ]]; then
-	umount /tmp/initramfs
-	#rm -r /tmp/initramfs
-fi
-
-verbose "Compiling dtbs"
-ARCH="arm" make dtbs
-
-verbose "copying ftd file"
-#cp /usr/src/linux-NAS/arch/arm/boot/dts/kirkwood-db-88f6282.dtb /usr/src/linux-NAS/arch/arm/boot/board.dtb
-cp /usr/src/linux-NAS/arch/arm/boot/dts/kirkwood-d2net.dtb /usr/src/linux-NAS/arch/arm/boot/board.dtb
-
-verbose "Updating /etc/conf.d/atftpd"
-echo '# Config file for tftp server
-
-TFTPD_ROOT="/usr/src/linux-NAS/arch/arm/boot/"
-TFTPD_OPTS="--daemon --user nobody --group nobody"' > /etc/conf.d/atftp
-}
-
-set_variables
-configure_terminal
-for (( ; ; )); do
-	echo "Select an operation to perform from the list"
-	echo "a) Add a key"
-	echo "i) Import a key"
-	echo "l) List keys"
-    echo "lb) List backup keys"
-	echo "r) Remove a key"
-	echo "b) Backup keys"
-	echo "L) Create laptop boot partition"
-	echo "N) Create NAS key partition"
-	echo "B) Erase the boot drive"
-	echo "K) Erase the key drive"
-	echo "Kb) Erase the key drive"
-	echo "7) Update the kernel"
-	echo "9) Generate new key/header pair"
-	echo "q) Quit"
-	read input
-	case $input in
-		a)  open_luks "$serial_keys" "serial"
-            mount_dev "$serial_keys"
-            gen_key "$serial_keys"
-            clean_up
-            ;;
-		i)  open_luks "$serial_keys" "serial"
-            mount_dev "$serial_keys"
-            gen_key "$serial_keys"
-            clean_up
-            ;;
-		l)  open_luks "$serial_keys" "serial"
-            mount_dev "$serial_keys"
-            cecho "Existing keys:" "light_blue"
-            ls -lhRI lost+found /mnt/"$serial_keys"
-            clean_up
-            ;;
-		lb) open_luks "$serial_keys_backup" "serial"
-            mount_dev "$serial_keys_backup"
-            cecho "Existing keys:" "light_blue"
-            ls -lhRI lost+found /mnt/"$serial_keys_backup"
-            clean_up
-            ;;
-		r)  open_luks "$serial_keys" "serial"
-            mount_dev "$serial_keys"
-            del_key "$serial_keys"
-            clean_up
-            ;;
-        b)  open_luks "$serial_keys $serial_keys_backup" "serial"
-            mount_dev "$serial_keys $serial_keys_backup"
-            run_command "rsync -av --exclude lost+found /mnt/$serial_keys/ /mnt/$serial_keys_backup/" "" "Copying keys..." "0" ""
-            clean_up
-            ;;
-		L)  create_partitions "$serial_boot"
-            format_dev "\${dev_$serial_boot}1" "luks"
-			open_luks "\${dev_$serial_boot}1" "device"
-            mount_dev "\${dev_$serial_boot}1"
-			build_kernel "laptop"
-            if (eval "grub-install /dev/\$dev_$serial_boot"); then echo ok; else echo grub-install has failed; clean_up; fi
-			if (grub-mkconfig -o /boot/grub/grub.cfg); then echo config ok; else echo config has failed; clean_up; fi
-			clean_up
-			;;
-		N)	#kernel=$(readlink /usr/src/linux | sed 's/linux/kernel/g')
-#serial=$(lsblk -noserial /dev/$boot)
-			verbose "Checking if /dev/mapper/keys is mounted"; if [[ -n $(cat /proc/mounts | grep "/dev/mapper/keys") ]]; then verbose "Umounting"; umount /dev/mapper/keys; fi
-			verbose "Checking if \$dev_$boot_serial is open"; if [ -b /dev/mapper/keys ]; then verbose "Closing"; cryptsetup close keys; fi
-			if (eval "test -b /dev/\${dev_$boot_serial}2"); then verbose "The 100M boot partition has been found."; else echo -e "n\np\n2\n67584\n+100M\nw" | eval "fdisk /dev/\$dev_$boot_serial"; fi
-			verbose "Checking for /opt/keys/$boot_serial"; if [ ! -d /opt/keys ]; then mkdir /opt/keys; fi; if [ ! -d /opt/keys/$boot_serial ]; then mkdir /opt/keys/$boot_serial; fi
-			verbose "Creating $boot_serial header/key pair"; if [ $hardened == yes ]; then r_device=/dev/random; else r_device=/dev/urandom; fi; dd if=$r_device of=/opt/keys/$boot_serial/$boot_serial.key bs=512 count=8; dd if=/dev/zero of=/opt/keys/$boot_serial/$boot_serial.header bs=1k count=1028
-			verbose "Formatting /dev/mapper/$boot_serial"; eval cryptsetup luksFormat -q /dev/\${dev_$boot_serial}2 --header /opt/keys/$boot_serial/${boot_serial}.header --key-file /opt/keys/$boot_serial/${boot_serial}.key
-			verbose "Openning /dev/mapper/$boot_serial"; eval cryptsetup luksOpen /dev/\${dev_$boot_serial}2 --header /opt/keys/$boot_serial/${boot_serial}.header --key-file /opt/keys/$boot_serial/${boot_serial}.key $boot_serial
-			if [ $hardened == yes ]; then verbose "Erasing /dev/mapper/$boot_serial"; dd if=/dev/zero of=/dev/mapper/keys; fi
-			if (e2fsck /dev/mapper/$boot_serial); then verbose "filesystem on /dev/mapper/$boot_serial OK"; else verbose "Creating ext2 filesystem on /dev/mapper/$boot_serial"; mkfs.ext2 /dev/mapper/$boot_serial; fi
-			if [ ! -d /mnt/$boot_serial ]; then verbose "Creating $boot_serial mount directory"; mkdir /mnt/$boot_serial; fi
-			#if [[ -n $(cat /proc/mounts | grep $boot_serial) ]]; then verbose "Mounting $boot_serial"; 
-			mount /dev/mapper/$boot_serial /mnt/$boot_serial #; fi
-
-			if [[ ! -d "$initramfs_temp" ]]; then verbose "Creating $initramfs_temp directory"; mkdir /tmp/initramfs; fi
-			mount -o size=50M -t tmpfs tmpfs /tmp/initramfs
-			mkdir /tmp/initramfs/opt
-			mkdir /tmp/initramfs/opt/keys
-			eval "cryptsetup luksOpen /dev/\$dev_$serial_keys $serial_keys"
-			mkdir /mnt/$serial_keys
-			mount /dev/mapper/$serial_keys /mnt/$serial_keys
-
-			for key in $keys; do
-				mkdir /tmp/initramfs/opt/keys/$key
-				dd if=/dev/urandom of=/tmp/initramfs/opt/keys/$key/${key}.key bs=512 count=8
-				mkdir /mnt/$boot_serial/$key
-				dd if=/dev/zero of=/mnt/$boot_serial/$key/${key}.header bs=1k count=1028
-				dd if=/dev/zero of=/mnt/$boot_serial/$key/$key bs=512 count=8192
-				cryptsetup luksFormat -q /mnt/$boot_serial/$key/$key --key-file /tmp/initramfs/opt/keys/$key/${key}.key --header /mnt/$boot_serial/$key/${key}.header
-				cryptsetup luksOpen /mnt/$boot_serial/$key/$key --key-file /tmp/initramfs/opt/keys/$key/${key}.key --header /mnt/$boot_serial/$key/${key}.header $key
-				mkfs.ext2 /dev/mapper/$key
-				mkdir /mnt/$key
-				mount /dev/mapper/$key /mnt/$key
-				cp /mnt/$serial_keys/$key/$key* /mnt/$key/
-				umount /mnt/$key
-				rmdir /mnt/$key
-				cryptsetup luksClose $key
-			done
-
-			umount /mnt/$serial_keys
-			rmdir /mnt/$serial_keys
-			cryptsetup luksClose $serial_keys
-
-			umount /mnt/$boot_serial
-			rmdir /mnt/$boot_serial
-			cryptsetup close $boot_serial
-
-			build_NAS
-			;;
-		B)	erase_dev "$serial_boot"
-			;;
-		K)	erase_dev "$serial_keys"
-			;;
-		Kb)	erase_dev "$serial_keys_backup"
-			;;
-		7)	cd /usr/src/linux \
-			&& make \
-			&& make menuconfig \
-			&& cryptsetup luksOpen /dev/${boot}1 boot \
-			&& mount /dev/mapper/boot /boot \
-			&& cp /usr/src/linux/arch/x86_64/boot/bzImage /boot/$kernel \
-			&& grub-mkconfig -o /boot/grub/grub.cfg \
-			&& umount /boot \
-			&& cryptsetup luksClose boot
-			;;
-		9)	gen_new_key "$serial_keys"
-			;;
-		q) 	exit
-			;;
-		*)	echo "Invalid option"
-			;;
-	esac
-done
